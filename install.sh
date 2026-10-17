@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO="aditauqir/shev"
-VERSION="0.2.0"
+VERSION="0.2.1"
 if [ -n "${SHEV_PREFIX:-}" ]; then
   PREFIX="$SHEV_PREFIX"
 elif [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
