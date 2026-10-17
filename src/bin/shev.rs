@@ -2631,7 +2631,7 @@ fn parse_responses_arg() -> Result<PathBuf, String> {
                      OPTIONS:\n\
                      \x20   -f, --file <path>    where decisions are appended (default {DEFAULT_RESPONSES_FILE})\n\
                      \x20   -h, --help           show this help\n\n\
-                     Keys: enter send · ctrl+j newline · / commands · ctrl+c quit"
+                     Keys: enter send · ctrl+j newline · ctrl+t model · ctrl+h history · / commands · ctrl+c quit"
                 );
                 std::process::exit(0);
             }
