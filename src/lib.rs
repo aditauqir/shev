@@ -24,10 +24,13 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
+
+pub mod integrations;
 
 const API_BASE: &str = "https://api.deepseek.com";
 pub const MODEL: &str = "deepseek-chat";
@@ -72,6 +75,16 @@ Rules:
   never above 100.
 - No extra keys, no prose outside the JSON, no markdown fences."#;
 
+/// The lean prompt for the local model. The remote prompt above is long — some
+/// four hundred words — and on a small on-device model almost all of the latency
+/// is the prompt prefill, so the faster path wants the same rules in far fewer
+/// tokens. Same five fields, same one-object contract.
+const LOCAL_SYSTEM_PROMPT: &str = r#"You are a decision engine. The user gives one message and what they want to do with it.
+Judge the message as a whole, once. Reply with one JSON object and nothing else:
+{"actionable":"","take_action":false,"confidence":70,"summary":"","generated_response":""}
+Fill in those five fields. take_action is true only for an outstanding action relevant to the user's intent; false when none remains. Do not invent obligations. confidence is an integer 34..100. summary is at most 3 sentences and 120 words. generated_response is the concise reply or next step, ready to use.
+No prose outside the JSON, no markdown fences."#;
+
 /// The instruction that wraps the user's message and their stated intent.
 const USER_TEMPLATE: &str = "WHAT THE USER WANTS TO DO WITH THIS MESSAGE:\n%INTENT%\n\nTHE MESSAGE, AS A WHOLE:\n<message>\n%MESSAGE%\n</message>";
 
@@ -91,8 +104,14 @@ pub fn cli_run() -> Result<(), String> {
     let interactive = io::stdin().is_terminal();
     let client = http_client()?;
 
-    // 1 + 2: onboarding and verification, in that order.
-    let api_key = obtain_api_key(&client, interactive)?;
+    // Local by default. Only the explicitly selected remote provider needs a key.
+    let target = match load_provider() {
+        Provider::Bonsai => {
+            ensure_bonsai_ready()?;
+            Target::bonsai()
+        }
+        Provider::DeepSeek => Target::deepseek(&obtain_api_key(&client, interactive)?),
+    };
 
     // 3: one message, or a loop over messages.
     if let Some(message) = options.once {
@@ -100,7 +119,7 @@ pub fn cli_run() -> Result<(), String> {
             .intent
             .clone()
             .unwrap_or_else(|| DEFAULT_INTENT.to_string());
-        let decision = request_decision(&client, &api_key, &message, &intent)?;
+        let decision = request_decision_target(&client, &target, &message, &intent)?;
         store_decision(&options.responses, &decision, &message, &intent)?;
         return Ok(());
     }
@@ -119,7 +138,7 @@ pub fn cli_run() -> Result<(), String> {
             .intent
             .clone()
             .unwrap_or_else(|| DEFAULT_INTENT.to_string());
-        let decision = request_decision(&client, &api_key, &message, &intent)?;
+        let decision = request_decision_target(&client, &target, &message, &intent)?;
         store_decision(&options.responses, &decision, &message, &intent)?;
         return Ok(());
     }
@@ -140,7 +159,7 @@ pub fn cli_run() -> Result<(), String> {
         let Some(intent) = read_intent(&mut stdin)? else {
             break;
         };
-        match request_decision(&client, &api_key, &message, &intent) {
+        match request_decision_target(&client, &target, &message, &intent) {
             Ok(decision) => store_decision(&options.responses, &decision, &message, &intent)?,
             Err(err) => eprintln!("request failed: {err}\n(the message was not recorded)"),
         }
@@ -349,7 +368,7 @@ impl Target {
     pub fn bonsai() -> Self {
         Self {
             provider: Provider::Bonsai,
-            // no server: the local pack runs in a one-shot subprocess
+            // no network server: the local pack runs in a resident worker
             chat_url: String::new(),
             models_url: String::new(),
             model: bonsai_dir().display().to_string(),
@@ -469,16 +488,62 @@ pub fn request_decision_target(
     ))
 }
 
-/// Answer one decision with the local Bonsai pack. There is no server, so this
-/// runs the pack's bundled loader in a subprocess, feeds the whole prompt on
-/// stdin (system prompt and user template together) and parses the decision out
-/// of its stdout.
+/// Answer one decision with the local Bonsai pack. Prefers the warm engine: the
+/// model is loaded once and kept resident, so every decision after the first
+/// skips the reload that dominates the one-shot path. If the engine cannot
+/// start, or dies mid-request, this falls back to the cold one-shot loader.
 fn request_decision_bonsai(user_content: &str) -> Result<Value, String> {
+    local_decision_with_retry(user_content, |prompt| match warm_engine_decide(prompt) {
+        Ok(reply) => Ok(reply),
+        Err(warm) => Ok(LocalReply {
+            text: bonsai_oneshot(prompt).map_err(|cold| {
+                format!("local worker failed ({warm}); fallback failed ({cold})")
+            })?,
+            usage: json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}),
+        }),
+    })
+}
+
+fn local_decision_with_retry(
+    user_content: &str,
+    mut run: impl FnMut(&str) -> Result<LocalReply, String>,
+) -> Result<Value, String> {
+    let mut prompt = format!("{LOCAL_SYSTEM_PROMPT}\n\n{user_content}");
+    let mut usage = json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0});
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        let reply = run(&prompt)?;
+        for field in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+            usage[field] = json!(
+                usage[field]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(reply.usage[field].as_u64().unwrap_or(0))
+            );
+        }
+        match parse_decision(&reply.text) {
+            Ok(mut decision) => {
+                decision["model"] = json!(BONSAI_REPO);
+                decision["usage"] = usage;
+                return Ok(decision);
+            }
+            Err(error) => last_error = error,
+        }
+        prompt.push_str(&format!("\nFormat correction {}: return strictly valid JSON. Include commas between all five fields and use double-quoted strings. Keep every string short so the complete object fits in the token budget.", attempt + 1));
+    }
+    Err(format!(
+        "local model returned an invalid decision after 3 attempts: {last_error}"
+    ))
+}
+
+/// The original cold path: run the pack's bundled loader in a subprocess for a
+/// single request. Kept as the fallback for a machine where the resident engine
+/// cannot start.
+fn bonsai_oneshot(prompt: &str) -> Result<String, String> {
     let argv = bonsai_run_command()?;
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| "empty command".to_string())?;
-    let prompt = format!("{SYSTEM_PROMPT}\n\n{user_content}");
 
     let mut child = std::process::Command::new(program)
         .args(args)
@@ -504,17 +569,151 @@ fn request_decision_bonsai(user_content: &str) -> Result<Value, String> {
             snippet(&String::from_utf8_lossy(&output.stderr))
         ));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut decision = parse_decision(&text)?;
-    // the local pack does not report token usage
-    if let Some(object) = decision.as_object_mut() {
-        object.insert(
-            "usage".to_string(),
-            json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
-        );
+// ---------------------------------------------------------------------------
+// the warm local engine: one resident process, many decisions
+// ---------------------------------------------------------------------------
+
+/// A resident local engine: one Python process that holds the model in memory
+/// and answers one JSON request per line. The point is the reload it does *not*
+/// pay — the model load is the single biggest cost of a local decision.
+struct LocalEngine {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: io::BufReader<std::process::ChildStdout>,
+}
+
+struct LocalReply {
+    text: String,
+    usage: Value,
+}
+
+impl LocalEngine {
+    fn start() -> Result<Self, String> {
+        let argv = bonsai_worker_command()?;
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| "empty command".to_string())?;
+
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("could not start the local engine ({program}): {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "the local engine had no stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "the local engine had no stdout".to_string())?;
+
+        // the worker announces itself once the model is loaded
+        let mut stdout = io::BufReader::new(stdout);
+        let mut ready = String::new();
+        BufRead::read_line(&mut stdout, &mut ready)
+            .map_err(|e| format!("the local engine did not start: {e}"))?;
+        if !ready.contains("ready") {
+            let _ = child.kill();
+            return Err(format!(
+                "the local engine did not report ready: {}",
+                snippet(&ready)
+            ));
+        }
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
     }
-    Ok(decision)
+
+    fn decide(&mut self, prompt: &str) -> Result<LocalReply, String> {
+        let request = json!({ "prompt": prompt });
+        self.stdin
+            .write_all(request.to_string().as_bytes())
+            .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.flush())
+            .map_err(|e| format!("could not reach the local engine: {e}"))?;
+
+        loop {
+            let mut line = String::new();
+            let read = BufRead::read_line(&mut self.stdout, &mut line)
+                .map_err(|e| format!("could not read from the local engine: {e}"))?;
+            if read == 0 {
+                return Err("the local engine closed its output".to_string());
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                continue; // a streaming delta with no payload
+            }
+            let value: Value = serde_json::from_str(line)
+                .map_err(|e| format!("the local engine sent bad JSON: {e}"))?;
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                return Ok(LocalReply {
+                    text: text.to_string(),
+                    usage: value.get("usage").cloned().unwrap_or_else(
+                        || json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}),
+                    ),
+                });
+            }
+            if let Some(err) = value.get("error").and_then(Value::as_str) {
+                return Err(format!("the local engine failed: {err}"));
+            }
+            // otherwise it is a `delta` line: keep reading until `text`
+        }
+    }
+}
+
+impl Drop for LocalEngine {
+    fn drop(&mut self) {
+        // closing stdin ends the worker's loop; kill is the belt to that braces
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The one resident engine, behind a lock. `None` until the first local request.
+fn local_engine_slot() -> &'static Mutex<Option<LocalEngine>> {
+    static SLOT: OnceLock<Mutex<Option<LocalEngine>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Answer one prompt from the resident engine, starting it on first use and
+/// restarting it once if it died.
+fn warm_engine_decide(prompt: &str) -> Result<LocalReply, String> {
+    let slot = local_engine_slot();
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "the local engine lock was poisoned".to_string())?;
+
+    if guard.is_none() {
+        *guard = Some(LocalEngine::start()?);
+    }
+
+    // drop the whole engine on failure so the retry gets a clean process
+    let first = guard
+        .as_mut()
+        .ok_or_else(|| "the local engine vanished".to_string())?
+        .decide(prompt);
+    match first {
+        Ok(text) => Ok(text),
+        Err(first_error) => {
+            *guard = None;
+            let mut fresh = LocalEngine::start()?;
+            let text = fresh.decide(prompt).map_err(|second| {
+                format!("the local engine failed twice ({first_error}; {second})")
+            })?;
+            *guard = Some(fresh);
+            Ok(text)
+        }
+    }
 }
 
 /// Normalise whatever the model said into the guaranteed fields.
@@ -755,7 +954,7 @@ pub fn build_record(decision: &Value, message: &str, intent: &str) -> Value {
         "usage": decision.get("usage").cloned().unwrap_or(Value::Null),
         "user_intent": intent,
         "input": message,
-        "model": MODEL,
+        "model": decision.get("model").and_then(Value::as_str).unwrap_or(MODEL),
         "created_at": unix_timestamp(),
     })
 }
@@ -1064,7 +1263,7 @@ fn parse_args() -> Result<Option<Options>, String> {
 
 fn print_help() {
     println!(
-        "shev — hand a whole message and your intent to DeepSeek, get back a decision and a response\n\n\
+        "shev — hand a whole message and your intent to Bonsai (default) or DeepSeek, get back a decision and a response\n\n\
          USAGE:\n\
          \x20   shev                          interactive loop\n\
          \x20   shev \"some message\"            judge one message and exit\n\
@@ -1087,6 +1286,338 @@ fn print_help() {
 }
 
 // ---------------------------------------------------------------------------
+// skills, plugins and tools: reuse what Codex and OpenCode already have
+// ---------------------------------------------------------------------------
+
+/// One thing shev can load as extra guidance: a skill, a plugin, or an MCP tool
+/// that is already installed for Codex or OpenCode. shev only reads these; it
+/// never edits them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capability {
+    /// "skill", "plugin" or "tool".
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    /// The file holding the guidance (a SKILL.md), when there is one.
+    pub path: Option<PathBuf>,
+    /// Where it came from, for the label.
+    pub source: String,
+}
+
+/// The folders Codex and OpenCode keep their skills in. Only the ones that
+/// exist are returned, so a machine with none simply discovers nothing.
+pub fn capability_roots() -> Vec<(String, PathBuf)> {
+    let home = home_dir();
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let codex = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    let mut candidates = vec![
+        ("opencode", config.join("opencode/skills")),
+        ("opencode", config.join("opencode/skill")),
+        ("claude", home.join(".claude/skills")),
+        ("codex", codex.join("skills")),
+        ("shared", home.join(".agents/skills")),
+        ("shared", home.join("skills")),
+    ];
+    if let Ok(cwd) = env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            for relative in [
+                ".opencode/skills",
+                ".opencode/skill",
+                ".agents/skills",
+                ".codex/skills",
+            ] {
+                candidates.push(("project", ancestor.join(relative)));
+            }
+        }
+    }
+    for config_file in opencode_configs()
+        .into_iter()
+        .chain(opencode_project_configs())
+    {
+        let Some(value) = fs::read_to_string(&config_file)
+            .ok()
+            .and_then(|text| parse_jsonc(&text))
+        else {
+            continue;
+        };
+        let Some(skills) = value.get("skills") else {
+            continue;
+        };
+        if let Some(paths) = skills
+            .as_array()
+            .or_else(|| skills.get("paths").and_then(Value::as_array))
+        {
+            for path in paths.iter().filter_map(Value::as_str) {
+                if path.contains("://") {
+                    continue;
+                } // Never download instructions during discovery.
+                let path = if let Some(relative) = path.strip_prefix("~/") {
+                    home.join(relative)
+                } else {
+                    let path = PathBuf::from(path);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        config_file.parent().unwrap_or(Path::new(".")).join(path)
+                    }
+                };
+                candidates.push(("configured", path));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, path)| path.is_dir())
+        .map(|(source, path)| (source.to_string(), path))
+        .collect()
+}
+
+/// Read `name:` and `description:` out of a SKILL.md front matter block.
+fn parse_front_matter(text: &str) -> (Option<String>, Option<String>) {
+    let mut name = None;
+    let mut description = None;
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (None, None);
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        let unquote = |value: &str| {
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string()
+        };
+        if let Some(value) = line.strip_prefix("name:") {
+            name = Some(unquote(value));
+        } else if let Some(value) = line.strip_prefix("description:") {
+            description = Some(unquote(value));
+        }
+    }
+    (name, description)
+}
+
+/// Strip a leading `---` front matter block, leaving the body.
+pub fn strip_front_matter(text: &str) -> String {
+    let mut in_body = false;
+    let mut started = false;
+    let mut body = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if !started {
+            if index == 0 && line.trim() == "---" {
+                started = true;
+                continue;
+            }
+            break;
+        }
+        if !in_body {
+            if line.trim() == "---" {
+                in_body = true;
+            }
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if in_body {
+        body.trim_start_matches('\n').to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Best-effort parse of JSON with `//` and `/* */` comments and trailing commas,
+/// which is how OpenCode writes its config. Strict JSON is a subset, so this
+/// reads both. Read-only and tolerant: returns `None` rather than failing a scan.
+fn parse_jsonc(text: &str) -> Option<Value> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut stripped = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_string {
+            stripped.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            stripped.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        stripped.push(ch);
+        i += 1;
+    }
+
+    // drop the commas that the removed comments left dangling before a closer
+    let mut cleaned = String::with_capacity(stripped.len());
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_string {
+            cleaned.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            cleaned.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if matches!(chars.get(j), Some(&'}') | Some(&']')) {
+                i += 1; // the trailing comma; leave it out
+                continue;
+            }
+        }
+        cleaned.push(ch);
+        i += 1;
+    }
+
+    serde_json::from_str(&cleaned).ok()
+}
+
+/// Everything loadable: the skills under the Codex/OpenCode roots, plus the MCP
+/// servers registered for OpenCode (those are the "tools").
+pub fn discover_capabilities() -> Vec<Capability> {
+    let mut out: Vec<Capability> = Vec::new();
+
+    for (source, root) in capability_roots() {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let file = dir.join("SKILL.md");
+            if !file.is_file() {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&file) else {
+                continue;
+            };
+            let (name, description) = parse_front_matter(&text);
+            let name = name
+                .or_else(|| dir.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_default();
+            out.push(Capability {
+                kind: "skill".to_string(),
+                name,
+                description: description.unwrap_or_default(),
+                path: Some(file),
+                source: source.clone(),
+            });
+        }
+    }
+
+    for server in integrations::servers() {
+        out.push(Capability {
+            kind: "tool".to_string(),
+            name: server.name,
+            description: "MCP server · enter to inspect read-only tools".to_string(),
+            path: None,
+            source: server.source,
+        });
+    }
+    for path in opencode_configs()
+        .into_iter()
+        .chain(opencode_project_configs())
+    {
+        let Some(value) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| parse_jsonc(&text))
+        else {
+            continue;
+        };
+        if let Some(plugins) = value
+            .get("plugins")
+            .or_else(|| value.get("plugin"))
+            .and_then(Value::as_array)
+        {
+            for plugin in plugins {
+                if let Some(name) = plugin
+                    .as_str()
+                    .or_else(|| plugin.get("package").and_then(Value::as_str))
+                {
+                    out.push(Capability {
+                        kind: "plugin".into(),
+                        name: name.to_string(),
+                        description: "Requires OpenCode host runtime · not a native shev plugin"
+                            .into(),
+                        path: None,
+                        source: "opencode".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
+    out.dedup_by(|a, b| a.kind == b.kind && a.name == b.name);
+    out
+}
+
+/// The guidance text of a capability: the SKILL.md body, front matter stripped.
+/// Read-only — shev never writes back to the source.
+pub fn capability_guidance(capability: &Capability) -> Result<String, String> {
+    let Some(path) = &capability.path else {
+        return Ok(String::new());
+    };
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    Ok(strip_front_matter(&text).trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
 // models: a remote DeepSeek endpoint, or a local MLX model
 // ---------------------------------------------------------------------------
 
@@ -1094,11 +1625,11 @@ fn print_help() {
 pub const DEEPSEEK_MODEL: &str = MODEL;
 /// The local MLX model pack, run on Apple Silicon through its bundled loader.
 /// Stock mlx-lm/mlx-vlm cannot load these weights, so there is no server to hit:
-/// each request runs the pack's own runtime in a one-shot subprocess.
+/// the pack's own runtime stays resident between requests.
 pub const BONSAI_REPO: &str = "prism-ml/Ternary-Bonsai-2-2B-mlx-2bit";
 pub const BONSAI_DIR_NAME: &str = "Ternary-Bonsai-2-2B-mlx-2bit";
 /// How many tokens the local model may generate for one decision.
-pub const BONSAI_MAX_TOKENS: u32 = 2048;
+pub const BONSAI_MAX_TOKENS: u32 = 256;
 
 /// Which model backs a request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1155,14 +1686,17 @@ fn write_config_map(map: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// Which model the user last selected. DeepSeek unless told otherwise.
+/// Which model the user last selected. Bonsai unless told otherwise.
 pub fn load_provider() -> Provider {
     load_config_map()
         .get("provider")
         .and_then(Value::as_str)
         .and_then(Provider::from_slug)
-        .unwrap_or(Provider::DeepSeek)
+        .unwrap_or(DEFAULT_PROVIDER)
 }
+
+/// Local inference is primary; remote inference must be explicitly selected.
+pub const DEFAULT_PROVIDER: Provider = Provider::Bonsai;
 
 pub fn save_provider(provider: Provider) -> Result<(), String> {
     let mut map = load_config_map();
@@ -1310,7 +1844,7 @@ def read_json(name, default):
 def sampler_settings():
     gen = read_json("generation_config.json", {})
     out = {
-        "temperature": gen.get("temperature", 1.0),
+        "temperature": float(os.environ.get("SHEV_BONSAI_TEMPERATURE", "0")),
         "top_p": gen.get("top_p", 0.95),
         "top_k": gen.get("top_k", 20),
     }
@@ -1397,6 +1931,218 @@ if __name__ == "__main__":
     main()
 "####;
 
+/// The warm worker: the same loader as `BONSAI_RUNNER`, but it loads the model
+/// once and then answers one JSON request per line, so the reload that dominates
+/// a one-shot decision is paid once and not again. Generation stops the moment
+/// the reply closes its top-level JSON object, which keeps the answer short and
+/// guarantees a single object.
+const BONSAI_WORKER: &str = r####""""shev's warm worker for the Ternary Bonsai MLX pack.
+
+    python shev_bonsai_worker.py <pack-dir>
+
+Loads the pack's model once, then serves one request per line on stdin:
+
+    {"prompt": "<the whole prompt>"}
+
+and answers one result per line on stdout:
+
+    {"text": "<the decision, a single JSON object>"}
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+pack = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(pack / "runtime"))
+max_tokens = int(os.environ.get("SHEV_BONSAI_MAX_TOKENS", "256"))
+stream = os.environ.get("SHEV_BONSAI_STREAM") == "1"
+
+
+def read_json(name, default):
+    path = pack / name
+    return json.loads(path.read_text()) if path.is_file() else default
+
+
+def sampler_settings():
+    gen = read_json("generation_config.json", {})
+    out = {
+        "temperature": float(os.environ.get("SHEV_BONSAI_TEMPERATURE", "0")),
+        "top_p": gen.get("top_p", 0.95),
+        "top_k": gen.get("top_k", 20),
+    }
+    if gen.get("do_sample") is False:
+        out["temperature"] = 0.0
+    return out
+
+
+def render(prompt):
+    template = pack / "chat_template.jinja"
+    if not template.is_file():
+        return prompt
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    return env.from_string(template.read_text()).render(
+        messages=[{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+
+class JsonWatch:
+    "Track whether a stream of pieces has closed one top-level {...} object."
+
+    def __init__(self):
+        self.depth = 0
+        self.seen = False
+        self.in_string = False
+        self.escaped = False
+        self.offset = 0
+        self.end = None
+
+    def feed(self, piece):
+        for ch in piece:
+            self.offset += 1
+            if self.in_string:
+                if self.escaped:
+                    self.escaped = False
+                elif ch == "\\":
+                    self.escaped = True
+                elif ch == '"':
+                    self.in_string = False
+                continue
+            if ch == '"':
+                self.in_string = True
+            elif ch == "{":
+                self.depth += 1
+                self.seen = True
+            elif ch == "}":
+                self.depth -= 1
+                if self.seen and self.depth == 0:
+                    self.end = self.offset
+                    return True
+        return False
+
+
+class Engine:
+    def __init__(self):
+        self.vision = bool(read_json("config.json", {}).get("components", {}).get("vision"))
+        if self.vision:
+            from vision_artifact import load_vl_model
+
+            self.model, self.processor, _ = load_vl_model(pack)
+        else:
+            import mlx.core as mx
+            from artifact import load_model
+            from tokenizers import Tokenizer
+
+            self.mx = mx
+            self.model, _ = load_model(pack)
+            self.tokenizer = Tokenizer.from_file(str(pack / "tokenizer.json"))
+            eos = read_json("generation_config.json", {}).get("eos_token_id")
+            self.stop = set(eos if isinstance(eos, list) else [] if eos is None else [eos])
+            self.stop |= {
+                i
+                for i in (
+                    self.tokenizer.token_to_id("<|im_end|>"),
+                    self.tokenizer.token_to_id("<|endoftext|>"),
+                )
+                if i is not None
+            }
+
+    def generate(self, prompt, on_token=None):
+        settings = sampler_settings()
+        self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        if self.vision:
+            from mlx_vlm import stream_generate
+
+            watch = JsonWatch()
+            pieces = []
+            generation = stream_generate(
+                self.model, self.processor, render(prompt), max_tokens=max_tokens, **settings
+            )
+            try:
+                for result in generation:
+                    piece = result if isinstance(result, str) else result.text
+                    if not isinstance(result, str):
+                        self.usage = {"prompt_tokens": result.prompt_tokens,
+                                      "completion_tokens": result.generation_tokens,
+                                      "total_tokens": result.total_tokens}
+                    pieces.append(piece)
+                    if on_token:
+                        on_token(piece)
+                    if watch.feed(piece):
+                        break
+            finally:
+                generation.close()
+            text = "".join(pieces)
+            return text[:watch.end] if watch.end is not None else text
+
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        sample = make_sampler(
+            temp=settings["temperature"],
+            top_p=settings["top_p"],
+            top_k=settings["top_k"],
+            min_p=settings.get("min_p", 0.0),
+        )
+        processors = make_logits_processors(repetition_penalty=settings.get("repetition_penalty"))
+        ids = self.tokenizer.encode(render(prompt), add_special_tokens=False).ids
+        x = self.mx.array([ids])
+        cache = self.model.make_cache()
+        watch = JsonWatch()
+        pieces = []
+        for _ in range(max_tokens):
+            logits = self.model.lm_head(self.model.model(x, cache=cache)[:, -1:, :])[:, -1, :]
+            for processor in processors:
+                logits = processor(self.mx.array(ids + pieces), logits)
+            x = sample(logits)[:, None]
+            self.mx.async_eval(x)  # queue the next step while Python runs
+            token = int(x.item())
+            if token in self.stop:
+                break
+            piece = self.tokenizer.decode([token])
+            pieces.append(token)
+            if on_token:
+                on_token(piece)
+            if watch.feed(piece):
+                break
+        self.usage = {"prompt_tokens": len(ids), "completion_tokens": len(pieces),
+                      "total_tokens": len(ids) + len(pieces)}
+        return self.tokenizer.decode(pieces)
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    engine = Engine()
+    emit({"ready": True})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            prompt = json.loads(line).get("prompt", "")
+            if stream:
+                text = engine.generate(
+                    prompt,
+                    on_token=lambda piece: emit({"delta": piece}),
+                )
+            else:
+                text = engine.generate(prompt)
+            emit({"text": text, "usage": engine.usage})
+        except Exception as exc:  # keep serving; report the failure
+            emit({"error": str(exc)})
+
+
+if __name__ == "__main__":
+    main()
+"####;
+
 /// Where the generated runner lives.
 pub fn bonsai_runner_path() -> PathBuf {
     models_dir().join("shev_bonsai_runner.py")
@@ -1408,6 +2154,21 @@ pub fn write_bonsai_runner() -> Result<PathBuf, String> {
     fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     let path = bonsai_runner_path();
     fs::write(&path, BONSAI_RUNNER)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Where the generated warm worker lives.
+pub fn bonsai_worker_path() -> PathBuf {
+    models_dir().join("shev_bonsai_worker.py")
+}
+
+/// Write the warm worker next to the model, refreshing it on every call.
+pub fn write_bonsai_worker() -> Result<PathBuf, String> {
+    let dir = models_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let path = bonsai_worker_path();
+    fs::write(&path, BONSAI_WORKER)
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok(path)
 }
@@ -1448,6 +2209,42 @@ pub fn bonsai_run_command() -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// The command that starts the warm worker: same environment as the one-shot
+/// runner, but a different script, with the model held in memory between
+/// requests. The pack dir is the trailing argument, as for the runner.
+pub fn bonsai_worker_command() -> Result<Vec<String>, String> {
+    if !bonsai_installed() {
+        return Err(format!(
+            "the bonsai model is not installed yet — install it into {}",
+            bonsai_dir().display()
+        ));
+    }
+    let worker = write_bonsai_worker()?.display().to_string();
+    let requirements = bonsai_dir()
+        .join("runtime")
+        .join("requirements.txt")
+        .display()
+        .to_string();
+
+    let mut argv: Vec<String> = if program_on_path("uv").is_some() {
+        vec![
+            "uv".to_string(),
+            "run".to_string(),
+            "--quiet".to_string(),
+            "--python".to_string(),
+            "3.12".to_string(),
+            "--with-requirements".to_string(),
+            requirements,
+            "python".to_string(),
+            worker,
+        ]
+    } else {
+        vec!["python3".to_string(), worker]
+    };
+    argv.push(bonsai_dir().display().to_string());
+    Ok(argv)
+}
+
 /// Everything a local request needs: the pack on disk and a fresh runner.
 pub fn ensure_bonsai_ready() -> Result<(), String> {
     if !bonsai_installed() {
@@ -1457,6 +2254,7 @@ pub fn ensure_bonsai_ready() -> Result<(), String> {
         ));
     }
     write_bonsai_runner()?;
+    write_bonsai_worker()?;
     Ok(())
 }
 
@@ -1626,7 +2424,8 @@ fn mcp_initialize() -> Value {
 }
 
 fn tool(name: &str, description: &str, schema: Value) -> Value {
-    json!({ "name": name, "description": description, "inputSchema": schema })
+    json!({ "name": name, "description": description, "inputSchema": schema,
+        "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true} })
 }
 
 fn mcp_tools() -> Value {
@@ -1808,13 +2607,33 @@ fn mcp_opencode_entry(exe: &Path, responses: &Path) -> Value {
     })
 }
 
+/// Where OpenCode keeps its config: the shared XDG config dir, under `opencode`.
+/// Both the modern `.json` and the comment-friendly `.jsonc`. (This used to point
+/// at a file inside shev's own config dir, so registrations and the tools shev
+/// borrowed from it never actually reached OpenCode.)
 fn opencode_configs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(config_root) = config_path().parent() {
-        out.push(config_root.join("opencode").join("opencode.json"));
-        out.push(config_root.join("opencode").join("opencode.jsonc"));
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"));
+    let dir = base.join("opencode");
+    vec![dir.join("opencode.json"), dir.join("opencode.jsonc")]
+}
+
+/// OpenCode config in the current project. Discovery only — shev never writes
+/// to these, so a borrowed tool is never registered behind your back.
+fn opencode_project_configs() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        let ancestors: Vec<_> = cwd.ancestors().collect();
+        for relative in ["", ".opencode"] {
+            for ancestor in ancestors.iter().rev() {
+                for name in ["opencode.json", "opencode.jsonc"] {
+                    paths.push(ancestor.join(relative).join(name));
+                }
+            }
+        }
     }
-    out
+    paths
 }
 
 fn write_pretty(path: &Path, value: &Value) -> Result<(), String> {
@@ -1840,7 +2659,7 @@ pub fn mcp_install(responses: &Path) -> Result<String, String> {
     write_pretty(&dir.join("server.json"), &descriptor)?;
     write_pretty(
         &dir.join("opencode.json"),
-        &json!({ "mcp": { "shev": entry.clone() } }),
+        &json!({ "mcp": { "servers": { "shev": entry.clone() } } }),
     )?;
 
     let mut report = vec![format!("wrote {}", dir.join("server.json").display())];
@@ -1855,7 +2674,10 @@ pub fn mcp_install(responses: &Path) -> Result<String, String> {
                     "registered with opencode in {} ({mode})",
                     candidate.display()
                 ));
-                registrations.insert(candidate.display().to_string(), json!({ "mode": mode }));
+                registrations.insert(
+                    candidate.display().to_string(),
+                    json!({ "mode": mode, "entry": entry }),
+                );
             }
             Err(e) => report.push(format!("could not update {}: {e}", candidate.display())),
         }
@@ -1885,7 +2707,8 @@ fn register_opencode(path: &Path, entry: &Value) -> Result<&'static str, String>
 
     let backup = PathBuf::from(format!("{}.shev.bak", path.display()));
     if !backup.exists() {
-        let _ = fs::write(&backup, &text);
+        fs::write(&backup, &text).map_err(|_| "could not back up OpenCode config".to_string())?;
+        restrict_permissions(&backup);
     }
 
     if let Ok(mut parsed) = serde_json::from_str::<Value>(&text) {
@@ -1894,29 +2717,75 @@ fn register_opencode(path: &Path, entry: &Value) -> Result<&'static str, String>
             .ok_or_else(|| "the opencode config is not a JSON object".to_string())?;
         let mcp = root.entry("mcp".to_string()).or_insert_with(|| json!({}));
         if !mcp.is_object() {
-            *mcp = json!({});
+            return Err("the existing MCP configuration is not an object; left unchanged".into());
         }
-        mcp.as_object_mut()
-            .expect("just made it an object")
-            .insert("shev".to_string(), entry.clone());
+        let native = mcp.get("servers").is_some() || mcp.as_object().is_some_and(Map::is_empty);
+        let servers = if native {
+            mcp.as_object_mut()
+                .unwrap()
+                .entry("servers")
+                .or_insert_with(|| json!({}))
+        } else {
+            mcp
+        };
+        let servers = servers
+            .as_object_mut()
+            .ok_or("the existing MCP servers configuration is not an object")?;
+        if servers.get("shev") == Some(entry) {
+            return Ok("json");
+        }
+        if servers.contains_key("shev") {
+            return Err("a shev registration already exists; left unchanged".into());
+        }
+        servers.insert("shev".to_string(), entry.clone());
         write_pretty(path, &parsed)?;
         return Ok("json");
     }
 
-    // JSONC (comments, trailing commas): insert straight after the mcp brace.
+    // JSONC: preserve comments and unrelated fields, and reject duplicates.
+    let parsed = parse_jsonc(&text).ok_or("the OpenCode config is not valid JSONC")?;
+    let servers = parsed.pointer("/mcp/servers").or_else(|| parsed.get("mcp"));
+    if servers.and_then(|m| m.get("shev")) == Some(entry) {
+        return Ok("jsonc");
+    }
+    if servers.and_then(|m| m.get("shev")).is_some() {
+        return Err("a shev registration already exists; left unchanged".into());
+    }
     let Some(anchor) = text.find("\"mcp\"") else {
         return Err("there is no \"mcp\" section to merge into".to_string());
+    };
+    let anchor = if parsed.pointer("/mcp/servers").is_some() {
+        anchor
+            + text[anchor..]
+                .find("\"servers\"")
+                .ok_or("the MCP servers section could not be located")?
+    } else {
+        anchor
     };
     let Some(brace) = text[anchor..].find('{') else {
         return Err("the \"mcp\" section could not be parsed".to_string());
     };
     let insert_at = anchor + brace + 1;
     let serialized = serde_json::to_string(entry).map_err(|e| format!("could not encode: {e}"))?;
-    let insert = format!("\n\t\"shev\": {serialized},");
+    let insert = format!("\n\t\"shev\": {serialized},\n");
     let mut merged = String::with_capacity(text.len() + insert.len());
     merged.push_str(&text[..insert_at]);
     merged.push_str(&insert);
     merged.push_str(&text[insert_at..]);
+    let mut verified = parse_jsonc(&merged)
+        .ok_or("MCP registration would produce invalid JSONC; left unchanged")?;
+    let location = if parsed.pointer("/mcp/servers").is_some() {
+        "/mcp/servers"
+    } else {
+        "/mcp"
+    };
+    let removed = verified
+        .pointer_mut(location)
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.remove("shev"));
+    if removed.as_ref() != Some(entry) || verified != parsed {
+        return Err("could not safely locate the MCP registration; left unchanged".into());
+    }
     fs::write(path, &merged).map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok("jsonc")
 }
@@ -1931,6 +2800,13 @@ fn unregister_opencode(path: &Path, mode: &str) -> Result<bool, String> {
     {
         let removed = parsed
             .get_mut("mcp")
+            .map(|mcp| {
+                if mcp.get("servers").is_some() {
+                    mcp.get_mut("servers").unwrap()
+                } else {
+                    mcp
+                }
+            })
             .and_then(Value::as_object_mut)
             .map(|mcp| mcp.remove("shev").is_some())
             .unwrap_or(false);
@@ -1961,6 +2837,19 @@ fn unregister_opencode(path: &Path, mode: &str) -> Result<bool, String> {
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..line_start]);
     out.push_str(&text[line_end..]);
+    let mut expected = parse_jsonc(&text).ok_or("could not safely parse the existing config")?;
+    let location = if expected.pointer("/mcp/servers").is_some() {
+        "/mcp/servers"
+    } else {
+        "/mcp"
+    };
+    expected
+        .pointer_mut(location)
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.remove("shev"));
+    if parse_jsonc(&out).as_ref() != Some(&expected) {
+        return Err("could not safely remove the registration; left unchanged".into());
+    }
     fs::write(path, out).map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok(true)
 }
@@ -1978,6 +2867,23 @@ pub fn mcp_uninstall() -> Result<String, String> {
         for (path, info) in registrations {
             let path = PathBuf::from(path);
             let mode = info.get("mode").and_then(Value::as_str).unwrap_or("json");
+            if let Some(expected) = info.get("entry") {
+                let current = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| parse_jsonc(&text));
+                let actual = current.as_ref().and_then(|value| {
+                    value
+                        .pointer("/mcp/servers/shev")
+                        .or_else(|| value.pointer("/mcp/shev"))
+                });
+                if actual != Some(expected) {
+                    report.push(format!(
+                        "left changed registration untouched in {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            }
             match unregister_opencode(&path, mode) {
                 Ok(true) => report.push(format!("unregistered from {}", path.display())),
                 Ok(false) => report.push(format!("nothing to undo in {}", path.display())),
@@ -2045,6 +2951,46 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bonsai_is_primary_and_deepseek_remains_selectable() {
+        assert_eq!(DEFAULT_PROVIDER, Provider::Bonsai);
+        assert_eq!(Provider::from_slug("deepseek"), Some(Provider::DeepSeek));
+        assert!(Target::bonsai().is_local());
+        let decision = json!({"model": BONSAI_REPO, "actionable": "Reply",
+                              "confidence": 80, "take_action": true});
+        assert_eq!(build_record(&decision, "m", "i")["model"], BONSAI_REPO);
+    }
+
+    #[test]
+    fn invalid_local_json_is_retried_and_all_usage_is_counted() {
+        let mut calls = 0;
+        let result = local_decision_with_retry("original intent", |prompt| {
+            calls += 1;
+            assert!(prompt.contains("original intent"));
+            if calls > 1 { assert!(prompt.contains("Format correction")); }
+            Ok(LocalReply {
+                text: if calls == 1 { "not JSON".into() } else {
+                    r#"{"actionable":"Reply","take_action":true,"confidence":80,"summary":"Reply.","generated_response":"OK."}"#.into()
+                },
+                usage: json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}),
+            })
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(result["usage"]["total_tokens"], 30);
+        let mut failures = 0;
+        assert!(
+            local_decision_with_retry("intent", |_| {
+                failures += 1;
+                Ok(LocalReply {
+                    text: "bad".into(),
+                    usage: json!({}),
+                })
+            })
+            .is_err()
+        );
+        assert_eq!(failures, 3);
+    }
 
     #[test]
     fn parses_a_healthy_decision() {
@@ -2264,6 +3210,161 @@ mod tests {
     }
 
     #[test]
+    fn the_warm_worker_loads_once_and_stops_at_the_json_object() {
+        // it announces readiness, then loops over requests without reloading
+        assert!(BONSAI_WORKER.contains("emit({\"ready\": True})"));
+        assert!(BONSAI_WORKER.contains("for line in sys.stdin"));
+        assert!(BONSAI_WORKER.contains("class JsonWatch"));
+        assert!(BONSAI_WORKER.contains("artifact"));
+        assert!(BONSAI_WORKER.contains("generation_config.json"));
+        // the model is loaded in Engine.__init__, i.e. once, not per request
+        assert!(BONSAI_WORKER.contains("class Engine"));
+    }
+
+    #[test]
+    fn the_vision_worker_really_stops_at_json_and_reports_usage() {
+        let script = r#"
+import ast, sys, types
+source = ast.parse(sys.stdin.read())
+classes = [node for node in source.body if isinstance(node, ast.ClassDef)]
+env = {'sampler_settings':lambda: {}, 'render':lambda s:s, 'max_tokens':256}
+exec(compile(ast.Module(body=classes,type_ignores=[]), '<worker>', 'exec'), env)
+watch = env['JsonWatch']()
+assert not watch.feed('{"a":"brace } inside string",')
+assert watch.feed('"b":{"c":1}} trailing')
+closed = []
+def stream(*args, **kwargs):
+    try:
+        yield types.SimpleNamespace(text='{"a":',prompt_tokens=9,generation_tokens=1,total_tokens=10)
+        yield types.SimpleNamespace(text='true} trailing',prompt_tokens=9,generation_tokens=2,total_tokens=11)
+        raise AssertionError('generated beyond closed JSON')
+    finally:
+        closed.append(True)
+sys.modules['mlx_vlm'] = types.SimpleNamespace(stream_generate=stream)
+engine = env['Engine'].__new__(env['Engine'])
+engine.vision, engine.model, engine.processor = True, None, None
+assert engine.generate('prompt') == '{"a":true}'
+assert closed == [True]
+assert engine.usage['total_tokens'] == 11
+"#;
+        let Ok(mut child) = std::process::Command::new("python3")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(BONSAI_WORKER.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn the_local_prompt_keeps_the_same_five_fields_in_fewer_tokens() {
+        for key in [
+            "actionable",
+            "take_action",
+            "confidence",
+            "summary",
+            "generated_response",
+        ] {
+            assert!(
+                LOCAL_SYSTEM_PROMPT.contains(key),
+                "the lean prompt lost {key}"
+            );
+        }
+        // the whole point is that the fast prompt is much smaller than the remote one
+        assert!(LOCAL_SYSTEM_PROMPT.len() * 2 < SYSTEM_PROMPT.len());
+    }
+
+    /// End-to-end timing for the resident local engine. Needs the Bonsai pack
+    /// installed, so it is ignored by default:
+    ///   cargo test --lib the_warm_local -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs the local Bonsai pack installed"]
+    fn the_warm_local_engine_serves_a_second_decision_faster() {
+        if !bonsai_installed() {
+            eprintln!("bonsai is not installed; skipping the warm-engine timing");
+            return;
+        }
+        let client = http_client().unwrap();
+        let target = Target::bonsai();
+        let message = "the electricity bill is due friday, pay it tonight";
+        let intent = "decide whether this needs action and say so";
+
+        let first = std::time::Instant::now();
+        let a = request_decision_target(&client, &target, message, intent).unwrap();
+        let first_ms = first.elapsed().as_millis();
+
+        let second = std::time::Instant::now();
+        let b = request_decision_target(&client, &target, message, intent).unwrap();
+        let second_ms = second.elapsed().as_millis();
+
+        eprintln!("first (load + decide): {first_ms} ms");
+        eprintln!("second (warm decide):  {second_ms} ms");
+        assert!(a.get("take_action").is_some());
+        assert!(b.get("take_action").is_some());
+        assert!(b["usage"]["total_tokens"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            second_ms < first_ms,
+            "the warm decision should beat the cold one ({second_ms} ms vs {first_ms} ms)"
+        );
+    }
+
+    #[test]
+    fn reads_a_skill_front_matter_without_touching_the_body() {
+        let text = "---\nname: tldraw-offline\ndescription: \"Drive the offline canvas.\"\n---\n\n# Steps\n\nDo the thing.\n";
+        let (name, description) = parse_front_matter(text);
+        assert_eq!(name.as_deref(), Some("tldraw-offline"));
+        assert_eq!(description.as_deref(), Some("Drive the offline canvas."));
+
+        let body = strip_front_matter(text);
+        assert!(body.starts_with("# Steps"), "body was {body:?}");
+        assert!(body.contains("Do the thing."));
+        assert!(
+            !body.contains("description:"),
+            "front matter leaked through"
+        );
+    }
+
+    #[test]
+    fn a_skill_without_front_matter_is_left_whole() {
+        let text = "# Just a body\n\nNo front matter here.\n";
+        assert_eq!(parse_front_matter(text), (None, None));
+        assert_eq!(strip_front_matter(text), text);
+    }
+
+    #[test]
+    fn reads_a_jsonc_config_with_comments_and_trailing_commas() {
+        let text = r#"{
+  // the servers shev can borrow
+  "mcp": {
+    "github": { "type": "remote", "url": "https://example/" }, /* inline */
+    "shadcn": { "command": ["npx", "shadcn@latest", "mcp"], },
+  },
+}"#;
+        let value = parse_jsonc(text).expect("jsonc should parse");
+        let mcp = value.get("mcp").unwrap().as_object().unwrap();
+        assert!(mcp.contains_key("github"), "the github tool must survive");
+        assert_eq!(mcp["shadcn"]["command"].as_array().unwrap().len(), 3);
+
+        // a `//` inside a string is not a comment
+        let value = parse_jsonc(r#"{"url": "https://a//b"}"#).unwrap();
+        assert_eq!(value["url"], "https://a//b");
+    }
+
+    #[test]
     fn carries_usage_into_the_record_and_counts_it() {
         let decision = json!({
             "actionable": "a",
@@ -2381,5 +3482,28 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}.shev.bak", path.display()));
+    }
+
+    #[test]
+    fn native_mcp_registration_preserves_other_servers_and_is_idempotent() {
+        let entry = json!({"type":"local","command":["shev","--mcp"]});
+        for (index, original) in [
+            "{\"mcp\":{\"servers\":{\"other\":{\"type\":\"remote\",\"url\":\"https://example.test\"}}}}",
+            "{\n// keep this comment\n\"mcp\": {\"servers\": {\"other\": {\"type\":\"remote\",\"url\":\"https://example.test\"},},},\n}",
+        ].into_iter().enumerate() {
+            let path = env::temp_dir().join(format!("shev-native-{}-{index}.jsonc", std::process::id()));
+            fs::write(&path, original).unwrap();
+            let mode = register_opencode(&path, &entry).unwrap();
+            let registered = fs::read_to_string(&path).unwrap();
+            assert_eq!(parse_jsonc(&registered).unwrap()["mcp"]["servers"]["shev"], entry);
+            register_opencode(&path, &entry).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), registered);
+            assert!(register_opencode(&path, &json!({"command":["different"]})).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), registered);
+            assert!(unregister_opencode(&path, mode).unwrap());
+            assert_eq!(parse_jsonc(&fs::read_to_string(&path).unwrap()), parse_jsonc(original));
+            fs::remove_file(&path).unwrap();
+            fs::remove_file(format!("{}.shev.bak", path.display())).unwrap();
+        }
     }
 }

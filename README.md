@@ -62,8 +62,9 @@ runs on any platform Rust does.</sub>
 shev
 ```
 
-1. First run, paste a DeepSeek API key when it asks. It's stored at
-   `~/.config/shev/config.json` as `0600` and reused after that.
+1. Bonsai is the default. Install it through `/model` if needed; no API key is
+   required. DeepSeek is optional through `/model`; its key is stored at
+   `~/.config/shev/config.json` as `0600`.
 2. Type or paste the whole message. **enter** sends it, **ctrl+j** drops a new
    line in the middle of a multi-line one.
 3. Say what you want done with it — "draft a short reply", "does this need me
@@ -79,7 +80,7 @@ After the first run it's just: run `shev`, type, done.
 
 - **Left, the model output.** A centred wordmark on its own solid panel at rest,
   then every decision as a clean field list. The prompt box sits flush at the
-  foot, with its mode line ("Build · deepseek-chat · …") on the last row.
+  foot, with its mode line ("Build · bonsai (local) · …") on the last row.
 - **Right, this turn's JSON only.** The raw record for the decision you are on,
   so you can read the file without leaving the screen.
 
@@ -98,6 +99,10 @@ stays readable. Type `/` for the command list:
 | `/home` | Back to the home screen (the transcript is kept) |
 | `/history` | Jump through the decisions so far |
 | `/mcp` | Install, remove, or report the local MCP bridge |
+| `/skills` | Load existing skill guidance; `/skills off` clears supporting context |
+| `/tools [server]` | Connect to a registered MCP server and inspect read-only tools |
+| `/tool server/tool <JSON>` | Call a read-only tool and attach its result to the next decision |
+| `/plugins` | Show host-plugin compatibility limits |
 | `/quit` | Leave |
 
 Handy keys:
@@ -115,19 +120,47 @@ Handy keys:
 
 `/model` switches between two backends and manages each one.
 
-**DeepSeek** — the default. Remote, fast, needs an API key. Options: enter a new
+**DeepSeek** — the secondary, explicitly selected remote option; needs an API key. Options: enter a new
 key, remove the stored key, or cancel.
 
-**Bonsai** — `prism-ml/Ternary-Bonsai-2-2B-mlx-2bit`, a small ternary model that
+**Bonsai (default)** — `prism-ml/Ternary-Bonsai-2-2B-mlx-2bit`, a small ternary model that
 runs on Apple Silicon through MLX. Options: install it from the internet
 (about 1.2 GB, into `~/.local/share/shev/models`) or uninstall it.
 
 The Bonsai pack ships its own loader, because its weights can't be loaded by
 stock `mlx-lm`/`mlx-vlm` (they report `Unsupported model type:
-prism_hadamard_qwen35`). So shev runs the pack's bundled runtime in a one-shot
-subprocess per request, using `uv` with the pack's pinned requirements. Nothing
-listens on a port, and no server is left running. The first local request
+prism_hadamard_qwen35`). So shev runs the pack's bundled runtime in a resident
+worker, using `uv` with the pack's pinned requirements. Repeated requests in the
+same session reuse the loaded model; a one-shot loader remains as fallback.
+Nothing listens on a port. The first local request
 installs the MLX stack into a `uv` environment, which can take a few minutes.
+
+### Output-head experiments
+
+This pack ties its output to `language_model.model.embed_tokens.as_linear`;
+there is no separate `language_model.lm_head`. Its native 2-bit operation
+requires the pack's Hadamard transform. Changing a `bits` parameter alone is
+not a valid conversion.
+
+`tools/bench-bonsai-head.py` compares native 2-bit with a correctly repacked
+4-bit output head **in memory**, leaving input embeddings and installed files
+untouched. Run with the pack's `runtime/requirements.txt`, after a local shev
+request has created `~/.local/share/shev/models/shev_bonsai_worker.py`:
+
+```sh
+uv run --python 3.12 --with-requirements \
+  ~/.local/share/shev/models/Ternary-Bonsai-2-2B-mlx-2bit/runtime/requirements.txt \
+  python tools/bench-bonsai-head.py
+```
+
+With the current deterministic prompt, one local run measured 1.55 ms/head and
+669 ms/decision for native 2-bit, versus 2.29 ms/head and 734 ms/decision for
+repacked 4-bit. Both scored 6/6 action labels on a tiny smoke test; an earlier
+prompt/sampled baseline scored 3/6. This is not evidence of general accuracy,
+and the improvement is from the prompt/sampling changes, not from repacking.
+Repacking cannot recover precision already lost in the 2-bit checkpoint.
+Native 2-bit therefore remains the default. Hardware, prompts and output length
+affect these timings; existing explicit provider selections are preserved.
 
 ## MCP
 
@@ -143,6 +176,42 @@ shev --mcp
 ```
 
 `/mcp uninstall` reverses the registration cleanly.
+
+### Reuse existing skills and tools
+
+`/skills` reads existing `SKILL.md` files from Codex, Claude, shared
+`~/.agents/skills`, `~/skills`, OpenCode's XDG config directory, and ancestor
+project `.opencode`, `.agents`, and `.codex` skill folders, plus local skill
+directories configured in OpenCode. It loads guidance
+into memory; it does not install, edit, or execute skill scripts.
+
+`/tools` reads MCP registrations from Codex's `config.toml` and OpenCode's
+global/project JSON or JSONC, including V2 `mcp.servers`. `CODEX_HOME` and
+`XDG_CONFIG_HOME` are respected. Selecting a server connects and lists tools;
+selecting a tool shows its argument schema and prepares `/tool server/tool {}`.
+Edit the arguments, then enter to call it. Successful results become reference
+context for the next decision; `/skills off` unloads them. Supporting context
+does not replace the user's original intent in history.
+
+Only tools with `readOnlyHint: true` and without `destructiveHint: true` can
+be called. Unknown/mutating tools are blocked, not silently approved. **MCP
+annotations are declarations from your trusted server, not a security sandbox**;
+only use servers you trust. Starting a configured server can run its startup
+code. Calls have time/output limits and cannot request sampling or approvals.
+Stdio and streamable HTTP (JSON/SSE) are supported. Configured headers and
+environment-based tokens are reused without logging them; host-managed OAuth
+credentials are not copied. An OAuth-only server reports an authentication
+requirement rather than claiming success.
+
+The top of the right pane names the loaded skill or successfully called tool
+and its source. Integration identity is also stored with its decision. Merely
+discovering/selecting a server is not reported as a successful tool call.
+
+OpenCode's configured JavaScript plugins are listed with compatibility notices.
+**Host-specific plugins cannot run natively in shev**; they require their host
+runtime. Their MCP interfaces, where registered, can be used through `/tools`.
+shev never rewrites host configuration during discovery or tool use. Explicit
+`/mcp install` is separate and backs up configuration before registration.
 
 ## CLI
 
@@ -170,7 +239,19 @@ Useful environment variables:
 | `SHEV_RESPONSES_FILE` | Where decisions are appended |
 | `SHEV_INTENT` | Default intent for a non-interactive run |
 | `SHEV_MODELS_DIR` | Where local models live |
-| `SHEV_BONSAI_MAX_TOKENS` | Token cap for the local model (default `2048`) |
+| `SHEV_BONSAI_MAX_TOKENS` | Local worker token cap (default `256`; cold fallback `2048`) |
+| `SHEV_BONSAI_STREAM` | `1` enables worker token-delta protocol messages |
+| `SHEV_BONSAI_TEMPERATURE` | Local sampling temperature (default `0`, deterministic) |
+
+The footer shows token usage and the last decision's elapsed milliseconds.
+The resident worker reports real local token counts; the cold fallback has no
+usage metadata and reports zero rather than guessing. The concise summary and
+generated response remain alongside the JSON. A measured warm run took about
+750 ms versus 2500 ms including initial model loading—not a claim of Jev's
+sub-100-ms latency.
+Malformed local decisions receive at most two format-correction retries; usage
+includes those attempts. Retries can add latency and still fail rather than
+silently recording invalid JSON.
 
 ## Where things live
 
