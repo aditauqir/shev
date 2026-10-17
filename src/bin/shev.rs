@@ -28,7 +28,7 @@ use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph};
@@ -864,19 +864,12 @@ impl App {
                             for (index, (_, tool)) in self.tool_catalog.iter().enumerate() {
                                 if integrations::read_only(tool) {
                                     let name = tool["name"].as_str().unwrap_or("unnamed");
-                                    items.push(menu_item(
-                                        name,
-                                        "read-only · enter to supply arguments",
-                                        MenuAction::PrepareTool(index),
-                                    ));
+                                    items.push(menu_item(name, "", MenuAction::PrepareTool(index)));
                                 }
                             }
-                            let count = items.len();
                             items.push(menu_item("close", "", MenuAction::Close));
-                            self.menu = Some(Menu::new(format!("tools · {server}"), vec![
-                                format!("{count} read-only tools offered; unknown/mutating tools blocked"),
-                                "Tool annotations are declarations from your trusted server, not a sandbox.".into(),
-                            ], items));
+                            self.menu =
+                                Some(Menu::new(format!("tools · {server}"), Vec::new(), items));
                             self.note("MCP server connected; no tool has been called yet");
                         }
                         Err(err) => self.warn(err),
@@ -1394,17 +1387,7 @@ impl App {
             "" => {
                 self.capabilities = discover_capabilities();
                 if self.capabilities.is_empty() {
-                    self.notify(
-                        "skills · none found",
-                        vec![
-                            "shev reads ~/.config/opencode/skills, ~/.claude/skills,".to_string(),
-                            "~/.codex/skills, ~/skills and ./.opencode/skills, plus the MCP"
-                                .to_string(),
-                            "servers registered in the OpenCode config.".to_string(),
-                            String::new(),
-                            "Drop a SKILL.md in one of those and run /skills again.".to_string(),
-                        ],
-                    );
+                    self.notify("skills", vec!["No skills or tools found.".into()]);
                     return;
                 }
                 self.menu = Some(skills_menu(self));
@@ -1896,6 +1879,8 @@ fn render_background(frame: &mut Frame, area: Rect) {
 fn render(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
     frame.render_widget(Block::default().style(base()), screen);
+    render_background(frame, screen);
+    let viewport = screen.inner(Margin::new(2, 1));
 
     let [header_area, main_area, hints_area, status_area] = Layout::vertical([
         Constraint::Length(1),
@@ -1903,7 +1888,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(screen);
+    .areas(viewport);
 
     render_header(frame, app, header_area);
 
@@ -1924,7 +1909,6 @@ fn render(frame: &mut Frame, app: &mut App) {
     };
 
     // the wallpaper sits behind both windows; the panels on top are solid
-    render_background(frame, main_area);
 
     // left window: the running output, with the prompt flush at its foot
     let prompt_height = desired_prompt_height(app, output.width, output.height);
@@ -3124,36 +3108,14 @@ fn skills_menu(app: &App) -> Menu {
         .enumerate()
         .map(|(index, capability)| {
             let label = format!("{} · {}", capability.kind, capability.name);
-            let hint = if capability.description.is_empty() {
-                format!("from {}", capability.source)
-            } else {
-                capability.description.clone()
-            };
-            menu_item(&label, hint, MenuAction::LoadCapability(index))
+            menu_item(&label, "", MenuAction::LoadCapability(index))
         })
         .collect();
     if app.loaded.is_some() {
-        items.push(menu_item(
-            "unload",
-            "back to a plain decision",
-            MenuAction::ClearCapability,
-        ));
+        items.push(menu_item("unload", "", MenuAction::ClearCapability));
     }
-    items.push(menu_item("close", "esc also closes", MenuAction::Close));
-
-    let loaded_line = match &app.loaded {
-        Some(loaded) => format!("loaded: {} · {}", loaded.kind, loaded.name),
-        None => "nothing loaded".to_string(),
-    };
-    Menu::new(
-        "skills · from Codex / OpenCode",
-        vec![
-            "read-only: shev borrows the guidance, never edits the source.".to_string(),
-            loaded_line,
-            format!("{} found", app.capabilities.len()),
-        ],
-        items,
-    )
+    items.push(menu_item("close", "", MenuAction::Close));
+    Menu::new("skills", Vec::new(), items)
 }
 
 /// A centered panel of the given width, sized to `height` rows.
@@ -3245,7 +3207,21 @@ fn render_menu(frame: &mut Frame, app: &App, screen: Rect) {
 
     let mut lines: Vec<Line> = vec![Line::default()];
     lines.extend(wrap_panel_body(&menu.body, inner));
-    for (index, item) in menu.items.iter().enumerate() {
+    let visible = (screen.height as usize)
+        .saturating_sub(lines.len() + 5)
+        .max(1);
+    let start = menu
+        .index
+        .saturating_sub(visible / 2)
+        .min(menu.items.len().saturating_sub(visible));
+    let label_width = menu
+        .items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(inner.saturating_sub(4));
+    for (index, item) in menu.items.iter().enumerate().skip(start).take(visible) {
         let selected = index == menu.index;
         let mut spans = vec![
             Span::raw("  "),
@@ -3254,12 +3230,15 @@ fn render_menu(frame: &mut Frame, app: &App, screen: Rect) {
                 if selected { accent_bold() } else { dim() },
             ),
             Span::styled(
-                pad(&item.label, 24),
+                pad(&truncate_chars(&item.label, label_width), label_width + 2),
                 if selected { accent_bold() } else { white() },
             ),
         ];
         if !item.hint.is_empty() {
-            spans.push(Span::styled(item.hint.clone(), dim()));
+            spans.push(Span::styled(
+                truncate_chars(&item.hint, inner.saturating_sub(label_width + 6)),
+                dim(),
+            ));
         }
         let line = Line::from(spans);
         lines.push(if selected {
@@ -3281,7 +3260,7 @@ fn render_menu(frame: &mut Frame, app: &App, screen: Rect) {
 fn parse_responses_arg() -> Result<PathBuf, String> {
     let mut responses = env::var_os("SHEV_RESPONSES_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_RESPONSES_FILE));
+        .unwrap_or_else(shev::default_responses_path);
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3300,6 +3279,7 @@ fn parse_responses_arg() -> Result<PathBuf, String> {
                 println!(
                     "MCP stdio: shev --mcp [-f <path>] (no terminal or API key required)\nChat: /clear keeps history · /reset clears saved chat data after confirmation\nHistory: ctrl+d deletes the selected entry after confirmation\nJSON: drag to select; release copies the selection to the clipboard"
                 );
+                println!("Maintenance: --version · --uninstall [--dry-run] [--yes]");
                 std::process::exit(0);
             }
             "-f" | "--file" => {
@@ -3315,6 +3295,9 @@ fn parse_responses_arg() -> Result<PathBuf, String> {
 }
 
 fn main() -> ExitCode {
+    if let Some(outcome) = shev::installation::maintenance() {
+        return outcome;
+    }
     if env::args().skip(1).any(|arg| arg == "--mcp") {
         return match shev::cli_run() {
             Ok(()) => ExitCode::SUCCESS,
@@ -3350,6 +3333,9 @@ fn main() -> ExitCode {
     };
 
     let (tx, rx) = mpsc::channel();
+    if let Err(error) = shev::installation::remember_history(&responses) {
+        eprintln!("note: {error}");
+    }
     let mut app = App::new(responses, client, tx, rx);
     app.load_history();
     app.start();
@@ -4135,6 +4121,8 @@ mod tests {
             menu.selected(),
             Some(MenuAction::LoadCapability(0))
         ));
+        assert!(menu.body.is_empty());
+        assert!(menu.items.iter().all(|item| item.hint.is_empty()));
 
         // loading one names it, read-only, and the pane says so at the top
         app.load_capability(0);
@@ -4277,6 +4265,33 @@ mod tests {
         assert_eq!(app.scroll, chat_scroll);
         let _ = draw_to_string(&mut app, 100, 30);
         assert!(app.json_cells.first().unwrap().bytes.start > 0);
+    }
+
+    #[test]
+    fn panels_float_inside_terminal_edges_and_long_skill_lists_scroll() {
+        let mut app = app_for_test();
+        let _ = draw_to_string(&mut app, 100, 30);
+        let prompt = app.prompt_rect.unwrap();
+        assert!(prompt.x >= 2 && prompt.right() <= 98);
+        assert!(prompt.y >= 1 && prompt.bottom() < 29);
+        app.capabilities = (0..80)
+            .map(|i| Capability {
+                kind: "skill".into(),
+                name: format!("skill-{i:02}"),
+                description: "unwanted description".into(),
+                source: "test".into(),
+                path: None,
+            })
+            .collect();
+        let mut menu = skills_menu(&app);
+        menu.index = 79;
+        app.menu = Some(menu);
+        let screen = draw_to_string(&mut app, 100, 30);
+        assert!(screen.contains("skill-79"));
+        assert!(!screen.contains("unwanted description"));
+        assert!(!screen.contains("read-only: shev borrows"));
+        assert!(!screen.contains("80 found"));
+        assert!(!screen.contains("skill-00"));
     }
 
     #[test]

@@ -5,6 +5,9 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if let Some(outcome) = shev::installation::maintenance() {
+        return outcome;
+    }
     match shev::cli_run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

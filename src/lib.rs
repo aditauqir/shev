@@ -30,7 +30,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
+pub mod installation;
 pub mod integrations;
+
+pub fn managed_home() -> Option<PathBuf> {
+    env::var_os("SHEV_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub fn default_responses_path() -> PathBuf {
+    managed_home()
+        .map(|home| home.join("responses.json"))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_RESPONSES_FILE))
+}
 
 const API_BASE: &str = "https://api.deepseek.com";
 pub const MODEL: &str = "deepseek-chat";
@@ -100,6 +113,7 @@ pub fn cli_run() -> Result<(), String> {
     if options.mcp {
         return mcp_serve(&options.responses);
     }
+    installation::remember_history(&options.responses)?;
 
     let interactive = io::stdin().is_terminal();
     let client = http_client()?;
@@ -254,6 +268,9 @@ pub fn verify_key(client: &reqwest::blocking::Client, key: &str) -> Result<(), S
 }
 
 pub fn config_path() -> PathBuf {
+    if let Some(home) = managed_home() {
+        return home.join("config/config.json");
+    }
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"));
@@ -278,7 +295,7 @@ fn legacy_config_path() -> PathBuf {
 /// Writes always go to [`config_path`], so the first save migrates the file.
 fn read_config_path() -> PathBuf {
     let path = config_path();
-    if path.exists() {
+    if path.exists() || managed_home().is_some() {
         return path;
     }
     let legacy = legacy_config_path();
@@ -1289,7 +1306,7 @@ struct Options {
 fn parse_args() -> Result<Option<Options>, String> {
     let mut responses = env::var_os("SHEV_RESPONSES_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_RESPONSES_FILE));
+        .unwrap_or_else(default_responses_path);
     let mut once: Option<String> = None;
     let mut intent: Option<String> = env::var("SHEV_INTENT").ok();
     let mut mcp = false;
@@ -1357,6 +1374,7 @@ fn print_help() {
          \x20   {{ \"actionable\": \"...\", \"take_action\": true, \"confidence\": 87,\n\
          \x20     \"generated_response\": \"...\" }}"
     );
+    println!("Maintenance: --version · --uninstall [--dry-run] [--yes]");
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,7 +1819,11 @@ pub fn remove_saved_key() -> Result<(), String> {
 pub fn models_dir() -> PathBuf {
     env::var_os("SHEV_MODELS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".local/share/shev/models"))
+        .unwrap_or_else(|| {
+            managed_home()
+                .map(|home| home.join("models"))
+                .unwrap_or_else(|| home_dir().join(".local/share/shev/models"))
+        })
 }
 
 pub fn bonsai_dir() -> PathBuf {
@@ -2369,6 +2391,8 @@ pub fn install_bonsai() -> Result<String, String> {
             bonsai_dir().display()
         ));
     }
+    fs::write(bonsai_dir().join(".shev-owned"), "shev model\n")
+        .map_err(|e| format!("could not mark the model installation: {e}"))?;
     Ok(format!(
         "installed {BONSAI_REPO} into {} ({})",
         bonsai_dir().display(),
@@ -2968,7 +2992,12 @@ pub fn mcp_uninstall() -> Result<String, String> {
             match unregister_opencode(&path, mode) {
                 Ok(true) => report.push(format!("unregistered from {}", path.display())),
                 Ok(false) => report.push(format!("nothing to undo in {}", path.display())),
-                Err(e) => report.push(format!("could not update {}: {e}", path.display())),
+                Err(e) => {
+                    return Err(format!(
+                        "could not update {}: {e}; registration manifest kept for retry",
+                        path.display()
+                    ));
+                }
             }
         }
     }

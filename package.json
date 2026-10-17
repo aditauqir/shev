@@ -1,0 +1,11 @@
+{
+  "name": "@aditauqir/shev",
+  "version": "0.2.0",
+  "description": "A simple Jev-like decision making tool, without the hype.",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/aditauqir/shev.git" },
+  "engines": { "node": ">=18" },
+  "bin": { "shev": "bin/shev.cjs", "shev-cli": "bin/shev-cli.cjs" },
+  "scripts": { "postinstall": "node scripts/install.cjs", "test": "node --test scripts/*.test.cjs" },
+  "files": ["bin", "scripts", "src", "assets", "Cargo.toml", "Cargo.lock", "install.sh", "README.md", "LICENSE"]
+}

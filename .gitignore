@@ -1,4 +1,10 @@
 /target
+/node_modules/
+/native/
+/state/
+/.install-state/
+/.shev-install-id
+/*.tgz
 
 # --- secrets: never commit an API key -------------------------------
 .env

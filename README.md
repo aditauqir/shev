@@ -39,11 +39,65 @@ One line, copy-pasteable:
 curl -fsSL https://raw.githubusercontent.com/aditauqir/shev/main/install.sh | bash
 ```
 
+Then type **`shev`**. The installer uses a user bin directory already on PATH
+where possible. Otherwise it adds a small, removable PATH block to your shell
+profile; open a new terminal and type `shev`—no manual shell edits needed.
+
+Prefer npm?
+
+```sh
+npm install -g git+https://github.com/aditauqir/shev.git
+shev
+```
+
+This installs the package **`@aditauqir/shev`**, with the terminal commands
+`shev` and `shev-cli`. The unscoped npm registry name `shev` belongs to an
+unrelated project; **do not use `npm install -g shev`** for this tool. This
+GitHub install does not require a separate npm registry publication.
+
+Both installers prefer a matching prebuilt release and otherwise build with
+Rust (installing the minimal Rust toolchain if necessary). npm uses the source
+shipped in its package, not an unrelated registry binary. macOS/Linux are
+supported by the npm launcher; Windows users can use WSL.
+
 Got Rust already? Same thing, just as short:
 
 ```sh
 cargo install --git https://github.com/aditauqir/shev
 ```
+
+### Uninstall
+
+For full cleanup, whether installed with curl or npm, close other running shev
+sessions first:
+
+```sh
+shev --uninstall --dry-run  # preview paths; delete nothing
+shev --uninstall            # confirm before removal
+# or: shev --uninstall --yes
+```
+
+This removes registered shev binaries, its saved keys/config, local model data,
+tracked chat records, unchanged tracked shev MCP registrations, and the exact PATH
+blocks added by its installer. A full npm-backed uninstall also runs npm's
+package removal. Modified binaries/profile blocks, externally managed weights,
+host recovery backups, unrelated host settings,
+non-chat metadata in export files, source checkouts, and shared tools/caches
+(Rust, Node, uv, Codex, OpenCode) are not deleted.
+
+You can also remove the npm package directly:
+
+```sh
+npm uninstall -g @aditauqir/shev
+```
+
+This removes the npm package and its binaries. **Modern npm does not execute
+uninstall hooks**, so it cannot also remove persistent settings/models/history
+or external MCP registrations. Use **`shev --uninstall`** for full cleanup;
+it handles the npm package removal too. Persistent npm data deliberately lives
+outside the package so a normal npm upgrade does not erase private keys,
+history, or model downloads. No background uninstall watchers or npm overrides
+are installed.
 
 ## What you need
 
@@ -88,6 +142,8 @@ without a background box or JSON pane. Once a chat starts, two windows appear:
   independently. `/copy json` copies the complete record, including off-screen text.
 
 Text panels use **`#0F0E08`** over the dimmed photo wallpaper. Type `/` for commands:
+Panels are inset from the terminal edges. Skills/tools menus show names only;
+long menus scroll around the selected row instead of clipping it off-screen.
 
 | Command | What it does |
 | --- | --- |
@@ -319,6 +375,7 @@ Useful environment variables:
 | `SHEV_RESPONSES_FILE` | Where decisions are appended |
 | `SHEV_INTENT` | Default intent for a non-interactive run |
 | `SHEV_MODELS_DIR` | Where local models live |
+| `SHEV_HOME` | Managed npm state root (set automatically by the npm launcher) |
 | `SHEV_BONSAI_MAX_TOKENS` | Local worker token cap (default `256`; cold fallback `2048`) |
 | `SHEV_BONSAI_STREAM` | `1` enables worker token-delta protocol messages |
 | `SHEV_BONSAI_TEMPERATURE` | Local sampling temperature (default `0`, deterministic) |
@@ -340,6 +397,14 @@ silently recording invalid JSON.
 | `~/.config/shev/config.json` | API key and the selected model (`0600`) |
 | `responses.json` | The decisions, appended as `response1`, `response2`, … |
 | `~/.local/share/shev/models/` | Downloaded local models |
+| `~/.config/shev/install.json` | Installer-owned binaries/PATH blocks and history paths for scoped cleanup |
+
+The npm launcher isolates its config, default history, and models under
+`~/.local/share/shev-npm/state/` (or `$XDG_DATA_HOME/shev-npm/state/`) instead
+of the paths above. This data survives npm upgrades. Shell
+and MCP integrations still read your existing host configuration without
+copying credentials. Explicit `--file`/`SHEV_RESPONSES_FILE` paths stay where you
+chose them and are tracked for explicit `shev --uninstall` cleanup.
 
 ## License
 
