@@ -1970,6 +1970,17 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("shev", accent_bold()),
         Span::styled(" — decisions, without the hype", dim()),
     ]);
+    let title_width: u16 = title
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count() as u16)
+        .sum();
+    // the wallpaper paints half-block glyphs into every cell; without a solid fill
+    // first, restyling the bar leaves those glyphs glowing after the title.
+    frame.render_widget(
+        Paragraph::new(Line::from(" ".repeat(area.width as usize))).style(base()),
+        area,
+    );
     frame.render_widget(Paragraph::new(title).style(base()), area);
 
     let button = if app.home {
@@ -1981,7 +1992,8 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let width = label.chars().count() as u16;
-    if area.width < width + 4 {
+    // only place the button when it will not sit on top of the tagline
+    if area.width < title_width + width + 2 {
         return;
     }
     let rect = Rect {
@@ -2094,7 +2106,14 @@ fn mode_line(app: &App) -> Line<'static> {
         Stage::Intent => ("Intent", "drives the response".to_string()),
         Stage::Working => (
             "Build",
-            format!("{} asking DeepSeek…", SPINNER[app.spinner % SPINNER.len()]),
+            format!(
+                "{} asking {}…",
+                SPINNER[app.spinner % SPINNER.len()],
+                match app.provider {
+                    Provider::DeepSeek => "DeepSeek",
+                    Provider::Bonsai => "bonsai (local)",
+                }
+            ),
         ),
         Stage::Result => (
             "Build",
@@ -3704,6 +3723,50 @@ mod tests {
         assert!(screen.contains("Message anything"), "{screen}");
         assert!(screen.contains("Message · deepseek-chat"), "{screen}");
         assert!(screen.contains("/ commands"), "{screen}");
+    }
+
+    #[test]
+    fn the_header_bar_does_not_let_the_wallpaper_bleed_through() {
+        let mut app = app_for_test();
+        app.stage = Stage::Message;
+        let screen = draw_to_string(&mut app, 60, 24);
+        let header = screen.lines().nth(1).expect("a header row");
+        assert!(
+            header.contains("shev — decisions, without the hype"),
+            "{header:?}"
+        );
+        // the bar is inset two columns from each edge; the wallpaper lives in that
+        // margin, but nothing inside the bar may keep its half-block glyphs, or the
+        // leftover cells glow as a bright strip after the title
+        let chars: Vec<char> = header.chars().collect();
+        let bar: String = chars[2..chars.len() - 2].iter().collect();
+        assert!(
+            !bar.contains('▀'),
+            "wallpaper glyphs leaked into the header bar: {bar:?}"
+        );
+    }
+
+    #[test]
+    fn the_working_line_names_the_model_in_use() {
+        let line = |app: &App| -> String {
+            mode_line(app)
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect()
+        };
+
+        let mut app = app_for_test();
+        app.stage = Stage::Working;
+
+        app.provider = Provider::Bonsai;
+        let bonsai = line(&app);
+        assert!(bonsai.contains("asking bonsai (local)"), "{bonsai}");
+        assert!(!bonsai.to_lowercase().contains("deepseek"), "{bonsai}");
+
+        app.provider = Provider::DeepSeek;
+        let deepseek = line(&app);
+        assert!(deepseek.contains("asking DeepSeek"), "{deepseek}");
     }
 
     #[test]

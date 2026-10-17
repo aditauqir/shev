@@ -1,3 +1,5 @@
+![shev — decisions, without the hype](assets/readme/hero.jpg)
+
 # shev
 
 **A simple Jev-like decision maker. Without the hype.**
@@ -157,6 +159,10 @@ without a background box or JSON pane. Once a chat starts, two windows appear:
 Text panels use **`#0F0E08`** over the dimmed photo wallpaper. Type `/` for commands:
 Panels are inset from the terminal edges. Skills/tools menus show names only;
 long menus scroll around the selected row instead of clipping it off-screen.
+
+![shev home screen](assets/readme/app-home.png)
+
+![shev decision view](assets/readme/app-decision.png)
 
 | Command | What it does |
 | --- | --- |
