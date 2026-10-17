@@ -1,14 +1,15 @@
 //! `shev` — a simple decision maker, without the hype.
 //!
-//! A TUI (black background, gray highlights, green accents) that puts the logo
-//! and an opencode-style prompt box front and centre. Type or paste a message,
-//! answer "what do you want to do with it", and the decision comes back as a
-//! clean field list with the prompt box still underneath for the next question.
+//! A TUI that puts a two-window chat front and centre: the model output on the
+//! left with the prompt box sitting flush at its foot, and the JSON for the
+//! current turn only in a column on the right. Type or paste a message, answer
+//! "what do you want to do with it", and the decision comes back as a clean
+//! field list while the raw JSON lands beside it.
 //!
 //! Slash commands: /file, /copy, /key, /cancel, /clear, /help, /model, /home,
-//! /mcp, /quit. The API key is read from `~/.config/shev/config.json` and
-//! reused, so it is only ever asked for once; `/model` can switch to a local MLX
-//! Bonsai model instead.
+//! /history, /mcp, /quit. The API key is read from `~/.config/shev/config.json`
+//! and reused, so it is only ever asked for once; `/model` (or ctrl+t) switches
+//! to a local MLX Bonsai model, and ctrl+h opens the history.
 
 use std::env;
 use std::fs;
@@ -40,35 +41,41 @@ use shev::{
 };
 
 // ---------------------------------------------------------------------------
-// theme: black, gray highlight, green accents
+// theme
+//
+// A four-colour Coolors palette: 60b2e5 (blue), dc758f (rose), e3d3e4
+// (lavender), 40434e (slate). The slate is the page background, 626675 is the
+// solid fill of every text box, and the blue and rose carry the accents.
 // ---------------------------------------------------------------------------
 
-const BG: Color = Color::Rgb(0, 0, 0);
-const PANEL: Color = Color::Rgb(26, 28, 26);
-const PANEL_HL: Color = Color::Rgb(58, 62, 58);
-const GRAY: Color = Color::Rgb(142, 145, 142);
-const DIM: Color = Color::Rgb(92, 96, 92);
-const GREEN: Color = Color::Rgb(88, 216, 134);
-const GREEN_DIM: Color = Color::Rgb(52, 128, 84);
-const WHITE: Color = Color::Rgb(228, 231, 228);
-const RED: Color = Color::Rgb(220, 96, 96);
-/// The message you are typing: an off-green gray, so it reads as yours.
-const MESSAGE_FG: Color = Color::Rgb(158, 180, 158);
-/// The question back to you (what do you want to do with it): warm sand.
-const INTENT_FG: Color = Color::Rgb(214, 188, 132);
+const BG: Color = Color::Rgb(0x40, 0x43, 0x4e);
+/// The solid fill behind every block of text, so it reads over the wallpaper.
+const PANEL: Color = Color::Rgb(0x62, 0x66, 0x75);
+/// The selected row inside a menu.
+const PANEL_HL: Color = Color::Rgb(0x79, 0x7e, 0x8f);
+const GRAY: Color = Color::Rgb(0xc3, 0xc7, 0xd1);
+const DIM: Color = Color::Rgb(0x96, 0x9a, 0xa7);
+const ACCENT: Color = Color::Rgb(0x60, 0xb2, 0xe5);
+const ACCENT_DIM: Color = Color::Rgb(0x41, 0x74, 0x9a);
+const WHITE: Color = Color::Rgb(0xe3, 0xd3, 0xe4);
+const RED: Color = Color::Rgb(0xdc, 0x75, 0x8f);
+/// The message you are typing: the lavender, so it reads as yours.
+const MESSAGE_FG: Color = Color::Rgb(0xe3, 0xd3, 0xe4);
+/// The question back to you (what do you want to do with it): the rose.
+const INTENT_FG: Color = Color::Rgb(0xdc, 0x75, 0x8f);
 /// The short "what you should do" summary.
-const SUMMARY_FG: Color = Color::Rgb(150, 200, 214);
+const SUMMARY_FG: Color = Color::Rgb(0x60, 0xb2, 0xe5);
 /// Clickable links and buttons.
-const LINK_FG: Color = Color::Rgb(126, 176, 240);
+const LINK_FG: Color = Color::Rgb(0x60, 0xb2, 0xe5);
 
 fn base() -> Style {
     Style::default().bg(BG).fg(GRAY)
 }
-fn green() -> Style {
-    Style::default().fg(GREEN)
+fn accent() -> Style {
+    Style::default().fg(ACCENT)
 }
-fn green_bold() -> Style {
-    Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+fn accent_bold() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 fn dim() -> Style {
     Style::default().fg(DIM)
@@ -90,7 +97,7 @@ fn stage_text_color(stage: Stage) -> Color {
 /// The colour of the accent bar running down the left of the prompt box.
 fn stage_accent(stage: Stage) -> Color {
     match stage {
-        Stage::Message | Stage::Result | Stage::Working => GREEN,
+        Stage::Message | Stage::Result | Stage::Working => ACCENT,
         Stage::Intent => INTENT_FG,
         Stage::Key => LINK_FG,
         Stage::Help => DIM,
@@ -120,10 +127,13 @@ const LOGO: [&str; 8] = [
     r#"M9mmmP'.JMML  JMML.`Mbmmd'     W     "#,
 ];
 const TITLE: &str = "shev — decisions, without the hype";
-/// The wallpaper behind everything, scaled to fit. Empty means none.
-const BACKGROUND: &str = include_str!("../../assets/background.txt");
-/// How faint the wallpaper is drawn.
-const BACKGROUND_FG: Color = Color::Rgb(22, 54, 36);
+/// The wallpaper behind everything: raw RGB, `u16 width | u16 height | pixels`
+/// (row-major, three bytes each). Regenerate with `tools/make-background.mjs`.
+const BACKGROUND: &[u8] = include_bytes!("../../assets/background.rgb");
+/// How much of the wallpaper survives on screen: a blend toward the slate, so
+/// the photo keeps its own colours but never fights the text on top of it.
+/// `0` is invisible, `255` is untouched.
+const BACKGROUND_OPACITY: u8 = 150;
 
 // ---------------------------------------------------------------------------
 // slash commands
@@ -136,7 +146,7 @@ struct Command {
     help: &'static str,
 }
 
-const COMMANDS: [Command; 10] = [
+const COMMANDS: [Command; 11] = [
     Command {
         name: "/file",
         args: " <path>",
@@ -184,6 +194,12 @@ const COMMANDS: [Command; 10] = [
         args: "",
         aliases: &["/start"],
         help: "back to the home screen (the transcript is kept)",
+    },
+    Command {
+        name: "/history",
+        args: "",
+        aliases: &["/log"],
+        help: "jump through earlier decisions (also ctrl+h)",
     },
     Command {
         name: "/mcp",
@@ -274,11 +290,16 @@ struct Overlay {
     body: Vec<String>,
 }
 
-/// A selectable menu, used by `/model`.
+/// A selectable menu, used by `/model` and `/mcp`.
 struct Menu {
     title: String,
     body: Vec<String>,
     items: Vec<MenuItem>,
+    index: usize,
+}
+
+/// The `/history` view: a jump list of the decisions, newest last.
+struct HistoryView {
     index: usize,
 }
 
@@ -300,6 +321,10 @@ enum MenuAction {
     RemoveKey,
     InstallModel,
     UninstallModel,
+    /// The `/mcp` menu.
+    McpInstall,
+    McpUninstall,
+    McpStatus,
     Close,
 }
 
@@ -386,6 +411,10 @@ struct App {
     home_rect: Option<Rect>,
     back_rect: Option<Rect>,
     json_rects: Vec<Rect>,
+    /// Start row of each decision in the output window, for the history jump.
+    entry_rows: Vec<usize>,
+    /// An open history view, if any.
+    history: Option<HistoryView>,
 }
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -441,6 +470,8 @@ impl App {
             home_rect: None,
             back_rect: None,
             json_rects: Vec::new(),
+            entry_rows: Vec::new(),
+            history: None,
         }
     }
 
@@ -809,6 +840,7 @@ impl App {
             "/file" => self.load_file(&rest),
             "/copy" => self.copy(&rest),
             "/home" => self.go_home(),
+            "/history" => self.open_history(),
             "/mcp" => self.mcp(&rest),
             "/model" => self.model(&rest),
             "/clear" => {
@@ -883,6 +915,67 @@ impl App {
         }
     }
 
+    /// ctrl+t: flip straight to the other model and remember the choice.
+    fn toggle_provider(&mut self) {
+        let next = match self.provider {
+            Provider::DeepSeek => Provider::Bonsai,
+            Provider::Bonsai => Provider::DeepSeek,
+        };
+        self.set_provider(next);
+    }
+
+    /// `/history` or ctrl+h: a jump list of the decisions so far.
+    fn open_history(&mut self) {
+        if self.entries.is_empty() {
+            self.note("no decisions yet — the history is empty");
+            return;
+        }
+        self.history = Some(HistoryView {
+            index: self.entries.len() - 1,
+        });
+        self.note("history — ↑↓ pick a decision, enter jumps to it, esc closes");
+    }
+
+    fn toggle_history(&mut self) {
+        if self.history.is_some() {
+            self.history = None;
+        } else {
+            self.open_history();
+        }
+    }
+
+    fn history_up(&mut self) {
+        let count = self.entries.len();
+        if let Some(view) = self.history.as_mut()
+            && count > 0
+        {
+            view.index = (view.index + count - 1) % count;
+        }
+    }
+
+    fn history_down(&mut self) {
+        let count = self.entries.len();
+        if let Some(view) = self.history.as_mut()
+            && count > 0
+        {
+            view.index = (view.index + 1) % count;
+        }
+    }
+
+    /// Jump the output window to the highlighted decision and close.
+    fn history_jump(&mut self) {
+        let Some(view) = self.history.take() else {
+            return;
+        };
+        self.home = false;
+        self.scroll = self
+            .entry_rows
+            .get(view.index)
+            .map(|row| (*row as u16).min(self.max_scroll))
+            .unwrap_or(self.max_scroll);
+        self.note("jumped to an earlier decision");
+    }
+
     /// Act on the highlighted item in whichever menu is open.
     fn run_menu_action(&mut self, action: MenuAction) {
         match action {
@@ -932,47 +1025,65 @@ impl App {
                     Box::new(uninstall_bonsai),
                 );
             }
+            MenuAction::McpInstall => {
+                self.menu = None;
+                self.spawn_mcp_install();
+            }
+            MenuAction::McpUninstall => {
+                self.menu = None;
+                self.spawn_mcp_uninstall();
+            }
+            MenuAction::McpStatus => {
+                self.menu = None;
+                self.show_mcp_status();
+            }
             MenuAction::Close => {
                 self.menu = None;
             }
         }
     }
 
-    /// `/mcp` — install, remove, or report the local MCP server.
+    /// `/mcp` — a menu, like `/model`, so the install is a pick, not a guess.
     fn mcp(&mut self, rest: &str) {
         match rest.trim().to_ascii_lowercase().as_str() {
-            "" | "status" => {
-                let mut body: Vec<String> = mcp_status()
-                    .split(" · ")
-                    .map(|part| part.to_string())
-                    .collect();
-                body.push(String::new());
-                body.push("usage: /mcp install · /mcp uninstall · /mcp status".to_string());
-                let title = if mcp_status().starts_with("off") {
-                    "mcp · not installed"
-                } else {
-                    "mcp · installed"
-                };
-                self.notify(title, body);
-            }
-            "install" => match mcp_install(&self.responses) {
-                Ok(report) => {
-                    let body: Vec<String> = report.lines().map(|line| line.to_string()).collect();
-                    self.notify("mcp · installed", body);
-                }
-                Err(err) => self.warn(format!("mcp install failed: {err}")),
-            },
-            "uninstall" | "remove" => match mcp_uninstall() {
-                Ok(report) => {
-                    let body: Vec<String> = report.lines().map(|line| line.to_string()).collect();
-                    self.notify("mcp · uninstalled", body);
-                }
-                Err(err) => self.warn(format!("mcp uninstall failed: {err}")),
-            },
+            "" => self.menu = Some(mcp_menu()),
+            "install" => self.spawn_mcp_install(),
+            "uninstall" | "remove" => self.spawn_mcp_uninstall(),
+            "status" => self.show_mcp_status(),
             other => self.warn(format!(
                 "usage: /mcp [install|uninstall|status] (got {other})"
             )),
         }
+    }
+
+    fn spawn_mcp_install(&mut self) {
+        let responses = self.responses.clone();
+        self.spawn_task(
+            "installing the mcp server",
+            Stage::Message,
+            Box::new(move || mcp_install(&responses)),
+        );
+    }
+
+    fn spawn_mcp_uninstall(&mut self) {
+        self.spawn_task(
+            "removing the mcp server",
+            Stage::Message,
+            Box::new(mcp_uninstall),
+        );
+    }
+
+    fn show_mcp_status(&mut self) {
+        let status = mcp_status();
+        let mut body: Vec<String> = status.split(" · ").map(|part| part.to_string()).collect();
+        body.push(String::new());
+        body.push("usage: /mcp install · /mcp uninstall · /mcp status".to_string());
+        let title = if status.starts_with("off") {
+            "mcp · not installed"
+        } else {
+            "mcp · installed"
+        };
+        self.notify(title, body);
     }
 
     fn cancel(&mut self) {
@@ -1220,100 +1331,115 @@ fn desired_prompt_height(app: &App, column_width: u16, column_height: u16) -> u1
     let lines = wrap_words(&text, inner)
         .len()
         .clamp(MIN_PROMPT_LINES, MAX_PROMPT_LINES);
-    // one row of top padding + the mode line + one row of bottom padding
-    let wanted = lines as u16 + 3;
-    let ceiling = column_height
-        .saturating_sub(
-            1 /* header */ + 1 /* hints */ + 1 /* status */ + 3, /* body */
-        )
-        .max(4);
+    // one row of top padding + the text + the mode line, nothing after it: the
+    // "Build" line is the last row of the box, flush against its bottom edge.
+    let wanted = lines as u16 + 2;
+    // never let the box swallow the pane: keep a few rows for the output
+    let ceiling = column_height.saturating_sub(3).max(3);
     wanted.min(ceiling)
 }
 
-/// Draw the wallpaper dimmed, scaled (nearest-neighbour) to fit the screen.
+/// Paint the wallpaper: the pasted photo, kept in its own colours as truecolour
+/// half-blocks (`▀`, two vertical pixels per cell), scaled to cover the area.
+/// Drawn straight into the buffer so it costs no per-cell spans.
 fn render_background(frame: &mut Frame, area: Rect) {
-    if BACKGROUND.trim().is_empty() || area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 || BACKGROUND.len() < 4 {
         return;
     }
-    let art: Vec<&str> = BACKGROUND.lines().collect();
-    let art_h = art.len();
-    let art_w = art
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
-    if art_h == 0 || art_w == 0 {
+    let src_w = u16::from_le_bytes([BACKGROUND[0], BACKGROUND[1]]) as usize;
+    let src_h = u16::from_le_bytes([BACKGROUND[2], BACKGROUND[3]]) as usize;
+    let pixels = &BACKGROUND[4..];
+    if src_w == 0 || src_h < 2 || pixels.len() < src_w * src_h * 3 {
         return;
     }
+    let src_cells_h = src_h / 2;
 
-    let avail_h = area.height as usize;
-    let avail_w = area.width as usize;
-    let row_step = art_h.div_ceil(avail_h).max(1);
-    let col_step = art_w.div_ceil(avail_w).max(1);
+    let area_w = area.width as usize;
+    let area_h = area.height as usize;
+    // cover: one scale for both axes, so the photo is never stretched
+    let scale_w = area_w as f32 / src_w as f32;
+    let scale_h = area_h as f32 / src_cells_h as f32;
+    let scale = scale_w.max(scale_h);
+    let draw_w = (src_w as f32 * scale).round().max(1.0) as isize;
+    let draw_h = (src_cells_h as f32 * scale).round().max(1.0) as isize;
+    let off_x = (area_w as isize - draw_w) / 2;
+    let off_y = (area_h as isize - draw_h) / 2;
 
-    let mut lines: Vec<Line> = Vec::new();
-    for row in art.iter().step_by(row_step) {
-        let chars: Vec<char> = row.chars().collect();
-        let mut sampled = String::new();
-        let mut index = 0;
-        while index < chars.len() {
-            sampled.push(chars[index]);
-            index += col_step;
-        }
-        lines.push(Line::from(Span::styled(
-            sampled,
-            Style::default().fg(BACKGROUND_FG),
-        )));
-    }
-
-    let height = (lines.len() as u16).min(area.height);
-    let target = Rect {
-        y: area.y + area.height.saturating_sub(height) / 2,
-        height,
-        ..area
+    let bg = (0x40u16, 0x43u16, 0x4eu16);
+    let opacity = BACKGROUND_OPACITY as u16;
+    let mix = |channel: u16, base: u16| -> u8 {
+        ((channel * opacity + base * (255 - opacity)) / 255).min(255) as u8
     };
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
-        target,
-    );
+    let at = |x: usize, y: usize| -> Color {
+        let index = (y.min(src_h - 1) * src_w + x.min(src_w - 1)) * 3;
+        Color::Rgb(
+            mix(pixels[index] as u16, bg.0),
+            mix(pixels[index + 1] as u16, bg.1),
+            mix(pixels[index + 2] as u16, bg.2),
+        )
+    };
+
+    let buffer = frame.buffer_mut();
+    for cy in 0..area_h {
+        for cx in 0..area_w {
+            let dx = cx as isize - off_x;
+            let dy = cy as isize - off_y;
+            if dx < 0 || dy < 0 || dx >= draw_w || dy >= draw_h {
+                continue;
+            }
+            let sx = (dx as f32 / scale) as usize;
+            let sy = (dy as f32 / scale) as usize;
+            let cell = &mut buffer[(area.x + cx as u16, area.y + cy as u16)];
+            cell.set_char('▀');
+            cell.set_fg(at(sx, sy * 2));
+            cell.set_bg(at(sx, sy * 2 + 1));
+        }
+    }
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
     frame.render_widget(Block::default().style(base()), screen);
 
-    let column_width = screen.width.saturating_sub(4).clamp(24, 96);
-    let [_, column, _] = Layout::horizontal([
+    let [header_area, main_area, hints_area, status_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Fill(1),
-        Constraint::Length(column_width),
-        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
     ])
     .areas(screen);
 
-    let prompt_height = desired_prompt_height(app, column.width, column.height);
-    let [header_area, body_area, prompt_area, hints_area, status_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(prompt_height),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(column);
-
     render_header(frame, app, header_area);
-    // the wallpaper lives only behind the body; the chrome stays solid
-    render_background(frame, body_area);
+
+    // two windows, as drawn in shev.tldraw: the model output on the left, the
+    // JSON for the current turn only in a narrow column on the right.
+    let json_width = (main_area.width / 3).clamp(20, 40);
+    let [output, json] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(json_width)]).areas(main_area);
+
+    // the wallpaper sits behind both windows; the panels on top are solid
+    render_background(frame, main_area);
+
+    // left window: the running output, with the prompt flush at its foot
+    let prompt_height = desired_prompt_height(app, output.width, output.height);
+    let [body_area, prompt_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(prompt_height)]).areas(output);
+
     if app.home || app.entries.is_empty() {
         render_logo(frame, app, body_area);
     } else {
         render_results(frame, app, body_area);
     }
     render_prompt(frame, app, prompt_area);
+
+    // right window: the JSON of the last turn only
+    render_json_window(frame, app, json);
+
     render_hints(frame, app, hints_area);
     render_status(frame, app, status_area);
 
     if app.palette {
-        render_palette(frame, app, column);
+        render_palette(frame, app, output);
     }
     if app.stage == Stage::Help {
         render_help(frame, app, screen);
@@ -1324,6 +1450,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     if app.menu.is_some() {
         render_menu(frame, app, screen);
     }
+    if app.history.is_some() {
+        render_history(frame, app, screen);
+    }
 }
 
 /// Top bar: the wordmark on the left, a clickable home / decisions button right.
@@ -1333,7 +1462,7 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled("shev", green_bold()),
+        Span::styled("shev", accent_bold()),
         Span::styled(" — decisions, without the hype", dim()),
     ]);
     frame.render_widget(Paragraph::new(title).style(base()), area);
@@ -1361,7 +1490,7 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
             label,
             Style::default()
                 .fg(BG)
-                .bg(GREEN)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         )))
         .style(Style::default().bg(BG)),
@@ -1392,10 +1521,10 @@ fn render_logo(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(0);
     let mut lines: Vec<Line> = trimmed
         .iter()
-        .map(|line| Line::from(Span::styled(pad(line, width), green())))
+        .map(|line| Line::from(Span::styled(pad(line, width), accent())))
         .collect();
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(TITLE, green_bold())));
+    lines.push(Line::from(Span::styled(TITLE, accent_bold())));
     if !app.entries.is_empty() {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -1423,11 +1552,11 @@ fn render_logo(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::default()
-            .style(Style::default().bg(BG))
+            .style(Style::default().bg(PANEL))
             .border_type(BorderType::Rounded)
             .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(GREEN_DIM))
-            .title(Line::from(Span::styled(" shev ", green()))),
+            .border_style(Style::default().fg(ACCENT_DIM))
+            .title(Line::from(Span::styled(" shev ", accent()))),
         rect,
     );
     let inner = Rect {
@@ -1439,7 +1568,7 @@ fn render_logo(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .alignment(Alignment::Center)
-            .style(Style::default().bg(BG)),
+            .style(Style::default().bg(PANEL)),
         inner,
     );
 }
@@ -1462,7 +1591,7 @@ fn placeholder(app: &App) -> String {
 }
 
 fn mode_line(app: &App) -> Line<'static> {
-    let (mode, accent) = match app.stage {
+    let (mode, note) = match app.stage {
         Stage::Key => ("Key", "stored locally, never printed".to_string()),
         Stage::Message => ("Message", "judged as a whole".to_string()),
         Stage::Intent => ("Intent", "drives the response".to_string()),
@@ -1481,11 +1610,11 @@ fn mode_line(app: &App) -> Line<'static> {
         Stage::Help => ("Help", "esc to go back".to_string()),
     };
     Line::from(vec![
-        Span::styled(mode, green_bold()),
+        Span::styled(mode, accent_bold()),
         Span::styled(" · ", dim()),
         Span::styled(model_label(app), white()),
         Span::styled(" · ", dim()),
-        Span::styled(accent, green()),
+        Span::styled(note, accent()),
     ])
 }
 
@@ -1494,9 +1623,16 @@ fn render_prompt(frame: &mut Frame, app: &mut App, area: Rect) {
     let [bar_area, box_area] =
         Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
 
-    // the accent bar on the left of the box, in the colour of the current stage
+    // the accent bar on the left of the box, in the colour of the current stage;
+    // painted as spaces so it reads as one solid stripe over the wallpaper
     frame.render_widget(
-        Block::default().style(Style::default().bg(stage_accent(app.stage))),
+        Paragraph::new(Text::from(vec![
+            Line::from(
+                " ".repeat(bar_area.width as usize)
+            );
+            bar_area.height as usize
+        ]))
+        .style(Style::default().bg(stage_accent(app.stage))),
         bar_area,
     );
 
@@ -1510,7 +1646,9 @@ fn render_prompt(frame: &mut Frame, app: &mut App, area: Rect) {
         wrap_with_cursor(&app.input, app.cursor, inner_width)
     };
 
-    let visible_rows = box_area.height.saturating_sub(3).max(1) as usize; // padding + mode line
+    // the box is top padding + the text rows + the mode line, and nothing else:
+    // the "Build" line sits on the last row, flush against the bottom edge.
+    let visible_rows = box_area.height.saturating_sub(2).max(1) as usize;
     let first_visible = if text.len() <= visible_rows {
         0
     } else {
@@ -1519,7 +1657,7 @@ fn render_prompt(frame: &mut Frame, app: &mut App, area: Rect) {
             .min(text.len() - visible_rows)
     };
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line> = vec![Line::default()]; // the row of top padding
     let text_color = stage_text_color(app.stage);
     if text.iter().all(|line| line.is_empty()) {
         lines.push(Line::from(vec![
@@ -1534,14 +1672,28 @@ fn render_prompt(frame: &mut Frame, app: &mut App, area: Rect) {
             ]));
         }
     }
+    // fill every reserved text row so the mode line is the last one, always
+    while lines.len() < visible_rows + 1 {
+        lines.push(Line::default());
+    }
     let mut mode = mode_line(app);
     mode.spans.insert(0, Span::raw(" "));
     lines.push(mode);
 
+    // fill every line to the box width, so the panel is solid over the photo
+    let width = box_area.width as usize;
+    for line in lines.iter_mut() {
+        let used = line_width(line);
+        if used < width {
+            line.spans.push(Span::styled(
+                " ".repeat(width - used),
+                Style::default().bg(PANEL),
+            ));
+        }
+    }
+
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .style(Style::default().bg(PANEL))
-            .block(Block::default().padding(Padding::vertical(1))),
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(PANEL)),
         box_area,
     );
 
@@ -1570,11 +1722,13 @@ fn render_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.stage {
             Stage::Result => {
-                "↑↓ scroll   enter new message   ctrl+y copy   / commands   ctrl+c quit"
+                "↑↓ scroll   enter new message   ctrl+t model   ctrl+h history   / commands   ctrl+c quit"
             }
             Stage::Working => "/cancel   ctrl+c quit",
             Stage::Key => "enter save   ctrl+c quit",
-            _ => "enter send   ctrl+j newline   / commands   ctrl+c quit",
+            _ => {
+                "enter send   ctrl+j newline   ctrl+t model   ctrl+h history   / commands   ctrl+c quit"
+            }
         }
     };
 
@@ -1602,7 +1756,7 @@ fn render_hints(frame: &mut Frame, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let right = Span::styled(
         format!("⌁ {} tokens consumed ", format_tokens(app.tokens)),
-        green(),
+        accent(),
     );
 
     let (text, style) = if app.status.is_empty() {
@@ -1610,7 +1764,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.status_error {
         (app.status.clone(), Style::default().fg(RED))
     } else {
-        (app.status.clone(), green())
+        (app.status.clone(), accent())
     };
     let room = area
         .width
@@ -1639,7 +1793,7 @@ fn span_width(span: &Span) -> usize {
 /// Wrap one decision's lines in its own solid box, borders and all.
 fn frame_lines(lines: Vec<Line<'static>>, box_width: usize) -> Vec<Line<'static>> {
     let inner = box_width.saturating_sub(4);
-    let edge = Style::default().fg(GREEN_DIM).bg(BG);
+    let edge = Style::default().fg(ACCENT_DIM).bg(PANEL);
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len() + 2);
     out.push(Line::from(Span::styled(
         format!("╭{}╮", "─".repeat(box_width.saturating_sub(2))),
@@ -1651,9 +1805,12 @@ fn frame_lines(lines: Vec<Line<'static>>, box_width: usize) -> Vec<Line<'static>
         spans.extend(
             line.spans
                 .into_iter()
-                .map(|span| span.patch_style(Style::default().bg(BG))),
+                .map(|span| span.patch_style(Style::default().bg(PANEL))),
         );
-        spans.push(Span::styled(" ".repeat(padding), Style::default().bg(BG)));
+        spans.push(Span::styled(
+            " ".repeat(padding),
+            Style::default().bg(PANEL),
+        ));
         spans.push(Span::styled(" │", edge));
         out.push(Line::from(spans));
     }
@@ -1674,7 +1831,9 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut button_rows: Vec<usize> = Vec::new();
+    app.entry_rows.clear();
     for entry in &app.entries {
+        app.entry_rows.push(lines.len());
         let (entry_lines, button) = entry_lines(entry, box_width, &file_name);
         if let Some(offset) = button {
             button_rows.push(lines.len() + offset);
@@ -1720,6 +1879,122 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The right-hand window: the JSON of the last turn only, as the sketch shows.
+fn render_json_window(frame: &mut Frame, app: &App, area: Rect) {
+    let inner = area.width.saturating_sub(2) as usize;
+    let file_name = app
+        .responses
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| app.responses.display().to_string());
+
+    let mut lines: Vec<Line> = Vec::new();
+    match app.entries.last() {
+        Some(entry) => {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", entry.key), accent_bold()),
+                Span::styled(format!("· {file_name}"), dim()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "─".repeat(inner.min(48)),
+                Style::default().fg(ACCENT_DIM),
+            )));
+            let pretty = serde_json::to_string_pretty(&entry.record).unwrap_or_default();
+            for raw in pretty.lines() {
+                for piece in wrap_words(raw, inner.saturating_sub(2).max(8)) {
+                    lines.push(Line::from(Span::styled(piece, Style::default().fg(GRAY))));
+                }
+            }
+        }
+        None => {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("no decision yet", dim())));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "the JSON for the turn you are on lands here, on its own.",
+                dim(),
+            )));
+        }
+    }
+    panel(frame, area, "this turn's JSON", lines);
+}
+
+/// The `/history` view: a compact jump list over the decisions so far.
+fn render_history(frame: &mut Frame, app: &App, screen: Rect) {
+    let Some(view) = &app.history else {
+        return;
+    };
+    if app.entries.is_empty() {
+        return;
+    }
+    let width = (screen.width.saturating_sub(8)).clamp(40, 92);
+    let inner = width.saturating_sub(4) as usize;
+
+    // a window around the selection, so a long history still fits
+    let visible = app.entries.len().min(14);
+    let start = if app.entries.len() > visible {
+        view.index
+            .saturating_sub(visible / 2)
+            .min(app.entries.len() - visible)
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = vec![Line::default()];
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{} decision(s) · ↑↓ pick · enter jumps", app.entries.len()),
+            dim(),
+        ),
+    ]));
+    lines.push(Line::default());
+    for index in start..start + visible {
+        let entry = &app.entries[index];
+        let selected = index == view.index;
+        let take_action = entry.record["take_action"].as_bool().unwrap_or(false);
+        let confidence = entry.record["confidence"].as_i64().unwrap_or(0);
+        let actionable = entry.record["actionable"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let tail = format!(
+            " c{confidence} {}",
+            if take_action { "act" } else { "skip" }
+        );
+        let label = truncate_chars(
+            &format!("{}  {actionable}", pad(&entry.key, 10)),
+            inner.saturating_sub(tail.chars().count() + 6),
+        );
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(
+                if selected { "▸ " } else { "  " },
+                if selected { accent_bold() } else { dim() },
+            ),
+            Span::styled(label, if selected { accent_bold() } else { white() }),
+            Span::styled(tail, dim()),
+        ];
+        spans.shrink_to_fit();
+        let line = Line::from(spans);
+        lines.push(if selected {
+            line.patch_style(Style::default().bg(PANEL_HL))
+        } else {
+            line
+        });
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("enter jumps to it · esc closes", dim()),
+    ]));
+    lines.push(Line::default());
+
+    let area = panel_area(screen, width, lines.len() as u16 + 2);
+    panel(frame, area, "history", lines);
+}
+
 /// One decision, framed in its own solid box: a summary of what to do, the field
 /// list, then the response and a button that reveals the JSON in the file manager.
 fn entry_lines(
@@ -1744,14 +2019,14 @@ fn entry_lines(
     let head = format!("▌ {}", entry.key);
     let gap = width.saturating_sub(head.chars().count() + right.chars().count() + 2);
     lines.push(Line::from(vec![
-        Span::styled(head, green_bold()),
+        Span::styled(head, accent_bold()),
         Span::styled(" ".repeat(gap.max(1)), base()),
-        Span::styled(right, green()),
+        Span::styled(right, accent()),
     ]));
 
     lines.push(Line::from(Span::styled(
         "─".repeat(width.min(96)),
-        Style::default().fg(GREEN_DIM),
+        Style::default().fg(ACCENT_DIM),
     )));
 
     // the short read, up top: at most three sentences of what to actually do
@@ -1805,14 +2080,14 @@ fn entry_lines(
         } else {
             actionable
         },
-        green(),
+        accent(),
     ));
     lines.extend(field(
         "take_action",
         take_action.to_string(),
-        if take_action { green() } else { dim() },
+        if take_action { accent() } else { dim() },
     ));
-    lines.extend(field("confidence", confidence.to_string(), green()));
+    lines.extend(field("confidence", confidence.to_string(), accent()));
     lines.extend(field(
         "user_intent",
         entry.record["user_intent"]
@@ -1937,7 +2212,7 @@ fn render_palette(frame: &mut Frame, app: &mut App, column: Rect) {
             let command = &COMMANDS[*index];
             let label = format!("{}{}", command.name, command.args);
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {}", pad(&label, label_width)), green()),
+                Span::styled(format!(" {}", pad(&label, label_width)), accent()),
                 Span::styled(command.help, dim()),
             ]))
         })
@@ -1957,7 +2232,7 @@ fn render_palette(frame: &mut Frame, app: &mut App, column: Rect) {
                     .border_type(BorderType::Rounded)
                     .borders(ratatui::widgets::Borders::ALL)
                     .border_style(dim())
-                    .title(Line::from(Span::styled(" commands ", green())))
+                    .title(Line::from(Span::styled(" commands ", accent())))
                     .padding(Padding::vertical(0)),
             ),
         area,
@@ -1966,9 +2241,11 @@ fn render_palette(frame: &mut Frame, app: &mut App, column: Rect) {
 }
 
 fn render_help(frame: &mut Frame, app: &App, screen: Rect) {
-    let keys: [(&str, &str); 11] = [
+    let keys: [(&str, &str); 14] = [
         ("enter", "send the message, then the intent"),
         ("ctrl+j", "newline inside the box"),
+        ("ctrl+t", "switch the model (DeepSeek ↔ Bonsai)"),
+        ("ctrl+h", "open the history of decisions"),
         ("↑ ↓", "scroll the decisions / move in a menu"),
         ("esc", "close a menu or notice, or leave home"),
         ("/", "open the command list"),
@@ -1977,7 +2254,8 @@ fn render_help(frame: &mut Frame, app: &App, screen: Rect) {
         ("ctrl+c", "quit"),
         ("/file <path>", "load a message from a file"),
         ("/model", "pick the model: DeepSeek, or local Bonsai"),
-        ("/key", "replace the DeepSeek API key"),
+        ("/history", "jump through earlier decisions"),
+        ("/mcp", "install or remove the MCP bridge"),
     ];
     let height = keys.len() as u16 + 4;
     let width = screen.width.saturating_sub(8).min(78);
@@ -1992,7 +2270,7 @@ fn render_help(frame: &mut Frame, app: &App, screen: Rect) {
     for (key, help) in keys {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{key:<14}"), green()),
+            Span::styled(format!("{key:<14}"), accent()),
             Span::styled(help, white()),
         ]));
     }
@@ -2008,7 +2286,7 @@ fn render_help(frame: &mut Frame, app: &App, screen: Rect) {
                     .border_type(BorderType::Rounded)
                     .borders(ratatui::widgets::Borders::ALL)
                     .border_style(dim())
-                    .title(Line::from(Span::styled(" shev · keys ", green()))),
+                    .title(Line::from(Span::styled(" shev · keys ", accent()))),
             ),
         area,
     );
@@ -2180,6 +2458,43 @@ fn model_label(app: &App) -> String {
     }
 }
 
+/// The `/mcp` menu: pick an action rather than remember the arguments.
+fn mcp_menu() -> Menu {
+    let installed = !mcp_status().starts_with("off");
+    let mut body: Vec<String> = mcp_status()
+        .split(" · ")
+        .map(|part| part.to_string())
+        .collect();
+    body.push(String::new());
+    body.push("enter runs the highlighted action".to_string());
+    Menu::new(
+        "mcp",
+        body,
+        vec![
+            menu_item(
+                if installed {
+                    "reinstall the server"
+                } else {
+                    "install the server"
+                },
+                "register the local, read-only MCP for other models",
+                MenuAction::McpInstall,
+            ),
+            menu_item(
+                "uninstall the server",
+                "remove the config and any registration",
+                MenuAction::McpUninstall,
+            ),
+            menu_item(
+                "show the status",
+                "where it is installed and who knows about it",
+                MenuAction::McpStatus,
+            ),
+            menu_item("close", "esc also closes", MenuAction::Close),
+        ],
+    )
+}
+
 /// A centered panel of the given width, sized to `height` rows.
 fn panel_area(screen: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(screen.width.saturating_sub(4)).max(20);
@@ -2221,7 +2536,7 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) 
                     .border_type(BorderType::Rounded)
                     .borders(ratatui::widgets::Borders::ALL)
                     .border_style(dim())
-                    .title(Line::from(Span::styled(format!(" {title} "), green()))),
+                    .title(Line::from(Span::styled(format!(" {title} "), accent()))),
             ),
         area,
     );
@@ -2275,11 +2590,11 @@ fn render_menu(frame: &mut Frame, app: &App, screen: Rect) {
             Span::raw("  "),
             Span::styled(
                 if selected { "▸ " } else { "  " }.to_string(),
-                if selected { green_bold() } else { dim() },
+                if selected { accent_bold() } else { dim() },
             ),
             Span::styled(
                 pad(&item.label, 24),
-                if selected { green_bold() } else { white() },
+                if selected { accent_bold() } else { white() },
             ),
         ];
         if !item.hint.is_empty() {
@@ -2401,6 +2716,7 @@ fn run_loop(
                     if !matches!(app.stage, Stage::Working | Stage::Help)
                         && app.menu.is_none()
                         && app.overlay.is_none()
+                        && app.history.is_none()
                     {
                         app.insert(&text);
                     }
@@ -2421,6 +2737,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Ctrl+C always quits.
     if ctrl && key.code == KeyCode::Char('c') {
         app.quit = true;
+        return;
+    }
+
+    // Hard ctrl, never cmd: ctrl+t flips the model, ctrl+h toggles the history.
+    if ctrl && !alt && key.code == KeyCode::Char('t') {
+        app.toggle_provider();
+        return;
+    }
+    if ctrl && !alt && key.code == KeyCode::Char('h') {
+        app.toggle_history();
         return;
     }
 
@@ -2455,6 +2781,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if app.overlay.is_some() {
         if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
             app.overlay = None;
+        }
+        return;
+    }
+
+    // The history view: arrows move, enter jumps, esc closes.
+    if app.history.is_some() {
+        match key.code {
+            KeyCode::Up => app.history_up(),
+            KeyCode::Down => app.history_down(),
+            KeyCode::Enter => app.history_jump(),
+            KeyCode::Esc => {
+                app.history = None;
+                app.note("closed the history");
+            }
+            _ => {}
         }
         return;
     }
@@ -2790,18 +3131,18 @@ mod tests {
         let mut app = app_for_test();
         app.stage = Stage::Message;
         let start = desired_prompt_height(&app, 80, 40);
-        assert_eq!(start, MIN_PROMPT_LINES as u16 + 3);
+        assert_eq!(start, MIN_PROMPT_LINES as u16 + 2);
 
         app.input = "one\ntwo\nthree\nfour".to_string();
-        assert_eq!(desired_prompt_height(&app, 80, 40), 4 + 3);
+        assert_eq!(desired_prompt_height(&app, 80, 40), 4 + 2);
 
-        // never past the cap, and never taller than the column can afford
+        // never past the cap, and never taller than the pane can afford
         app.input = "x\n".repeat(40);
         assert_eq!(
             desired_prompt_height(&app, 80, 40),
-            MAX_PROMPT_LINES as u16 + 3
+            MAX_PROMPT_LINES as u16 + 2
         );
-        assert!(desired_prompt_height(&app, 80, 12) <= 12 - 6);
+        assert!(desired_prompt_height(&app, 80, 12) <= 12 - 3);
     }
 
     #[test]
@@ -2920,6 +3261,98 @@ mod tests {
             home.y,
         );
         assert!(app.home);
+    }
+
+    #[test]
+    fn the_mode_line_is_the_last_row_of_the_prompt_box() {
+        let mut app = app_for_test();
+        let decision = serde_json::json!({
+            "actionable": "Pay the invoice",
+            "take_action": true,
+            "confidence": 91,
+            "generated_response": "ok",
+        });
+        app.entries.push(Entry {
+            key: "response1".to_string(),
+            record: build_record(&decision, "m", "i"),
+        });
+        app.stage = Stage::Result;
+        app.home = false;
+        let screen = draw_to_string(&mut app, 100, 34);
+
+        let box_rect = app.prompt_rect.expect("the prompt box must be drawn");
+        let row = screen
+            .lines()
+            .position(|line| line.contains("Build ·"))
+            .expect("the build line must be drawn");
+        assert_eq!(
+            row as u16,
+            box_rect.bottom() - 1,
+            "the build line has to sit flush on the last row of the box\n{screen}"
+        );
+
+        // and the two windows: the JSON for this turn is shown beside the output
+        assert!(screen.contains("this turn's JSON"), "{screen}");
+        assert!(screen.contains("\"confidence\""), "{screen}");
+    }
+
+    #[test]
+    fn the_history_view_lists_decisions_and_jumps_to_one() {
+        let mut app = app_for_test();
+        for index in 1..=3 {
+            let decision = serde_json::json!({
+                "actionable": format!("action {index}"),
+                "take_action": index % 2 == 0,
+                "confidence": 50 + index,
+                "generated_response": format!("reply {index}"),
+            });
+            app.entries.push(Entry {
+                key: format!("response{index}"),
+                record: build_record(&decision, "m", "i"),
+            });
+        }
+        app.stage = Stage::Result;
+        app.home = false;
+        // draw once so the entry rows are known
+        let _ = draw_to_string(&mut app, 100, 34);
+
+        // ctrl+h opens it, and the newest decision is highlighted
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+        assert!(app.history.is_some());
+        assert_eq!(app.history.as_ref().unwrap().index, 2);
+
+        // the list renders, and the arrows move
+        let screen = draw_to_string(&mut app, 100, 34);
+        assert!(screen.contains("history"), "{screen}");
+        assert!(screen.contains("response1"), "{screen}");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.history.as_ref().unwrap().index, 1);
+
+        // enter jumps the output to that decision and closes
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(app.history.is_none());
+        assert_eq!(app.scroll as usize, app.entry_rows[1]);
+    }
+
+    #[test]
+    fn the_mcp_menu_offers_install_and_uninstall() {
+        let menu = mcp_menu();
+        let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|label| label.contains("install")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("uninstall")),
+            "{labels:?}"
+        );
+        assert!(matches!(menu.selected(), Some(MenuAction::McpInstall)));
     }
 
     /// Not an assertion — a way to eyeball the layout:    /// `cargo test --bin shev -- --ignored --nocapture dump_screen`

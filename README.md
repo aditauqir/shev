@@ -75,12 +75,16 @@ After the first run it's just: run `shev`, type, done.
 
 ## The TUI
 
-`shev` opens a terminal UI: a centred wordmark on its own solid panel, a prompt
-box that starts at two lines and grows with your text, a command palette, and a
-token readout in the corner. The blocks sit on solid boxes over a dim background
-so the text stays readable.
+`shev` opens a two-window chat:
 
-Type `/` for the command list:
+- **Left, the model output.** A centred wordmark on its own solid panel at rest,
+  then every decision as a clean field list. The prompt box sits flush at the
+  foot, with its mode line ("Build · deepseek-chat · …") on the last row.
+- **Right, this turn's JSON only.** The raw record for the decision you are on,
+  so you can read the file without leaving the screen.
+
+Everything sits on a solid panel over a dimmed photo wallpaper, so the text
+stays readable. Type `/` for the command list:
 
 | Command | What it does |
 | --- | --- |
@@ -92,8 +96,20 @@ Type `/` for the command list:
 | `/help` | Show the keybindings |
 | `/model` | Pick the model and manage it (keys, install, uninstall) |
 | `/home` | Back to the home screen (the transcript is kept) |
+| `/history` | Jump through the decisions so far |
 | `/mcp` | Install, remove, or report the local MCP bridge |
 | `/quit` | Leave |
+
+Handy keys:
+
+| Key | What it does |
+| --- | --- |
+| `enter` | Send the message, then the intent |
+| `ctrl+j` | Newline inside the box |
+| `ctrl+t` | Switch the model (DeepSeek ↔ Bonsai) |
+| `ctrl+h` | Open the history (same as `/history`) |
+| `ctrl+y` | Copy the last generated response |
+| `ctrl+c` | Quit |
 
 ## Models
 
@@ -115,10 +131,12 @@ installs the MLX stack into a `uv` environment, which can take a few minutes.
 
 ## MCP
 
-`/mcp install` registers a local, read-only MCP server that hands your recorded
-decisions to other models. Tools: `list_decisions`, `latest_decision`,
-`get_decision`, `search_decisions`; resources: `deepslop://decisions` and
-`deepslop://decisions/latest`. The same server runs standalone:
+Run `/mcp` to open a small menu: pick **install** and it registers a local,
+read-only MCP server that hands your recorded decisions to other models. (The
+arguments still work too: `/mcp install`, `/mcp uninstall`, `/mcp status`.)
+Tools: `list_decisions`, `latest_decision`, `get_decision`, `search_decisions`;
+resources: `shev://decisions` and `shev://decisions/latest`. The same server
+runs standalone:
 
 ```sh
 shev --mcp
