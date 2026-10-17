@@ -76,24 +76,27 @@ After the first run it's just: run `shev`, type, done.
 
 ## The TUI
 
-`shev` opens a two-window chat:
+The home/start screen has a white ASCII wordmark directly over the wallpaper,
+without a background box or JSON pane. Once a chat starts, two windows appear:
 
-- **Left, the model output.** A centred wordmark on its own solid panel at rest,
-  then every decision as a clean field list. The prompt box sits flush at the
+- **Left, the model output.** Every decision as a clean field list. The prompt box sits flush at the
   foot, with its mode line ("Build · bonsai (local) · …") on the last row.
 - **Right, this turn's JSON only.** The raw record for the decision you are on,
-  so you can read the file without leaving the screen.
+  so you can read the file without leaving the screen. Drag across JSON text to
+  select it; releasing the mouse copies exactly the selection and shows
+  **✓ copied to clipboard** at the top center. The mouse wheel scrolls the JSON
+  independently. `/copy json` copies the complete record, including off-screen text.
 
-Everything sits on a solid panel over a dimmed photo wallpaper, so the text
-stays readable. Type `/` for the command list:
+Text panels use **`#0F0E08`** over the dimmed photo wallpaper. Type `/` for commands:
 
 | Command | What it does |
 | --- | --- |
 | `/file <path>` | Load a message from a file (drag-and-drop works too) |
-| `/copy [json]` | Copy the last response (or its JSON) to the clipboard |
+| `/copy [json]` | Copy selected JSON or the last response; `json` copies the complete record |
 | `/key` | Enter or replace the DeepSeek API key |
 | `/cancel` | Abort the request in flight |
-| `/clear` | Clear the box, or the transcript |
+| `/clear` | Clear the visible chat and input; keep saved history |
+| `/reset` | Confirm clearing the chat, all saved history, loaded context and counters; keep keys/models |
 | `/help` | Show the keybindings |
 | `/model` | Pick the model and manage it (keys, install, uninstall) |
 | `/home` | Back to the home screen (the transcript is kept) |
@@ -113,8 +116,13 @@ Handy keys:
 | `ctrl+j` | Newline inside the box |
 | `ctrl+t` | Switch the model (DeepSeek ↔ Bonsai) |
 | `ctrl+h` | Open the history (same as `/history`) |
-| `ctrl+y` | Copy the last generated response |
+| `ctrl+d` in history | Confirm deletion of only the selected saved entry |
+| `ctrl+y` | Copy selected JSON, or the last generated response |
 | `ctrl+c` | Quit |
+
+`/clear` starts a fresh chat view; `/history` can reopen retained records.
+`/reset` and history deletion default to **cancel** in their confirmation menus.
+Confirmed changes update the responses file, so MCP clients see them too.
 
 ## Models
 
@@ -164,18 +172,90 @@ affect these timings; existing explicit provider selections are preserved.
 
 ## MCP
 
-Run `/mcp` to open a small menu: pick **install** and it registers a local,
-read-only MCP server that hands your recorded decisions to other models. (The
-arguments still work too: `/mcp install`, `/mcp uninstall`, `/mcp status`.)
-Tools: `list_decisions`, `latest_decision`, `get_decision`, `search_decisions`;
-resources: `shev://decisions` and `shev://decisions/latest`. The same server
-runs standalone:
+Shev's MCP server lets **another assistant read your saved decisions**. It does
+not run Bonsai/DeepSeek or edit your files. No API key, OAuth login, terminal,
+network port, or separately started TUI is required: the MCP host starts shev
+as a subprocess and talks JSON-RPC over stdin/stdout.
+
+### 1. Choose the history file
+
+Save at least one decision using an explicit file path, for example:
 
 ```sh
-shev --mcp
+shev --file "$HOME/shev-responses.json"
 ```
 
-`/mcp uninstall` reverses the registration cleanly.
+Inside that TUI run **`/mcp install`** (or `/mcp` → install). This writes a
+descriptor under `~/.config/shev/mcp/` and registers the executable and absolute
+history path in an existing global OpenCode config, with a private backup.
+`/mcp status` reports the registration; `/mcp uninstall` removes shev's own
+unchanged registration. It does not delete your decisions.
+
+### 2. Connect OpenCode or Codex
+
+For OpenCode, reconnect **shev** from `/mcps` or restart the client after
+installation. Alternatively, register it explicitly from a shell (replace
+the executable path if you built from source):
+
+```sh
+opencode mcp add shev --global -- "$HOME/.local/bin/shev" --mcp --file "$HOME/shev-responses.json"
+opencode mcp list
+```
+
+The equivalent OpenCode V2 configuration is:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "shev": {
+        "type": "local",
+        "command": ["/absolute/path/to/shev", "--mcp", "--file", "/absolute/path/to/responses.json"],
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+For Codex, add this to `~/.codex/config.toml` (or your `CODEX_HOME` config),
+replacing the paths, then restart Codex and check `codex mcp list`:
+
+```toml
+[mcp_servers.shev]
+command = "/absolute/path/to/shev"
+args = ["--mcp", "--file", "/absolute/path/to/responses.json"]
+```
+
+Both `shev --mcp` and `shev-cli --mcp` work. For a source build, use
+`/absolute/path/to/repository/target/release/shev` after `cargo build --release`.
+Do not put shell expressions such as `$(pwd)` inside a JSON/TOML command array.
+
+### 3. Ask the host assistant to use shev
+
+Example prompts in OpenCode/Codex:
+
+- “Use shev's `latest_decision` tool and summarize my most recent decision.”
+- “Use shev's `search_decisions` with query `invoice` and limit `10`.”
+- “Read `response2` using shev's `get_decision` tool.”
+
+| Tool | Example arguments | Result |
+| --- | --- | --- |
+| `list_decisions` | `{"limit": 20}` | Most recent records, oldest first |
+| `latest_decision` | `{}` | Latest saved record |
+| `get_decision` | `{"key": "response2"}` or `{"index": 2}` | One saved record |
+| `search_decisions` | `{"query": "invoice", "limit": 10}` | Matching saved decisions |
+
+Resources are `shev://decisions` (all records) and
+`shev://decisions/latest` (latest record). Reads use the file afresh, so decisions
+saved by an open TUI become available without restarting the MCP process.
+
+**Troubleshooting:** `unknown option --mcp` means the host is launching an old
+TUI binary. Update/rebuild the **exact executable in the MCP command** and
+reconnect shev. Current releases dispatch `--mcp` before terminal setup. If
+connection succeeds but no decisions appear, check that the host and TUI use
+the same absolute history path. Starting `shev --mcp` manually will wait quietly
+for protocol input; this is normal, not a frozen chat window.
 
 ### Reuse existing skills and tools
 

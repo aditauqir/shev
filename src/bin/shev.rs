@@ -14,18 +14,21 @@
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph};
@@ -46,15 +49,15 @@ use shev::{
 // theme
 //
 // A four-colour Coolors palette: 60b2e5 (blue), dc758f (rose), e3d3e4
-// (lavender), 40434e (slate). The slate is the page background, 626675 is the
+// (lavender), 40434e (slate). The slate is the page background, 0F0E08 is the
 // solid fill of every text box, and the blue and rose carry the accents.
 // ---------------------------------------------------------------------------
 
 const BG: Color = Color::Rgb(0x40, 0x43, 0x4e);
 /// The solid fill behind every block of text, so it reads over the wallpaper.
-const PANEL: Color = Color::Rgb(0x62, 0x66, 0x75);
+const PANEL: Color = Color::Rgb(0x0f, 0x0e, 0x08);
 /// The selected row inside a menu.
-const PANEL_HL: Color = Color::Rgb(0x79, 0x7e, 0x8f);
+const PANEL_HL: Color = Color::Rgb(0x2a, 0x28, 0x1e);
 const GRAY: Color = Color::Rgb(0xc3, 0xc7, 0xd1);
 const DIM: Color = Color::Rgb(0x96, 0x9a, 0xa7);
 const ACCENT: Color = Color::Rgb(0x60, 0xb2, 0xe5);
@@ -148,7 +151,7 @@ struct Command {
     help: &'static str,
 }
 
-const COMMANDS: [Command; 15] = [
+const COMMANDS: [Command; 16] = [
     Command {
         name: "/file",
         args: " <path>",
@@ -176,8 +179,14 @@ const COMMANDS: [Command; 15] = [
     Command {
         name: "/clear",
         args: "",
-        aliases: &["/reset"],
-        help: "clear the box, or the transcript",
+        aliases: &["/cls"],
+        help: "clear the visible chat (saved history is kept)",
+    },
+    Command {
+        name: "/reset",
+        args: "",
+        aliases: &[],
+        help: "clear chat and all saved history after confirmation",
     },
     Command {
         name: "/help",
@@ -325,6 +334,25 @@ struct LoadedCapability {
     guidance: String,
 }
 
+#[derive(Clone)]
+struct JsonSelection {
+    anchor: Range<usize>,
+    focus: Range<usize>,
+    dragging: bool,
+    moved: bool,
+}
+
+impl JsonSelection {
+    fn range(&self) -> Range<usize> {
+        self.anchor.start.min(self.focus.start)..self.anchor.end.max(self.focus.end)
+    }
+}
+
+struct JsonCell {
+    position: Position,
+    bytes: Range<usize>,
+}
+
 /// A selectable menu, used by `/model` and `/mcp`.
 struct Menu {
     title: String,
@@ -344,7 +372,7 @@ struct MenuItem {
     action: MenuAction,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MenuAction {
     /// Show the list of models again.
     ModelList,
@@ -365,6 +393,8 @@ enum MenuAction {
     /// Unload whatever is loaded.
     ClearCapability,
     PrepareTool(usize),
+    ResetChat,
+    DeleteHistory(usize),
     Close,
 }
 
@@ -466,6 +496,13 @@ struct App {
     /// How long the last decision took, in milliseconds.
     last_ms: Option<u128>,
     tool_catalog: Vec<(String, Value)>,
+    json_area: Option<Rect>,
+    json_text: String,
+    json_cells: Vec<JsonCell>,
+    json_selection: Option<JsonSelection>,
+    json_scroll: usize,
+    json_max_scroll: usize,
+    copied_until: Option<Instant>,
 }
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -527,6 +564,13 @@ impl App {
             loaded: None,
             last_ms: None,
             tool_catalog: Vec::new(),
+            json_area: None,
+            json_text: String::new(),
+            json_cells: Vec::new(),
+            json_selection: None,
+            json_scroll: 0,
+            json_max_scroll: 0,
+            copied_until: None,
         }
     }
 
@@ -723,6 +767,8 @@ impl App {
             .collect();
         indexed.sort_by_key(|(index, _, _)| *index);
         let total = indexed.len();
+        self.entries.clear();
+        self.tokens = 0;
 
         // the token total covers everything on disk, not just the shown lines
         for (_, _, record) in &indexed {
@@ -976,14 +1022,13 @@ impl App {
                 "Unsupported or failed plugins are never labelled loaded. No host configuration is modified.".into(),
             ]),
             "/model" => self.model(&rest),
-            "/clear" => {
-                if self.stage == Stage::Result {
-                    self.entries.clear();
-                    self.scroll = 0;
-                    self.note("transcript cleared");
-                } else {
-                    self.note("input cleared");
-                }
+            "/clear" => self.clear_chat(),
+            "/reset" => {
+                self.history = None;
+                self.menu = Some(Menu::new("reset all chat data?", vec![
+                    format!("Deletes saved chat history from {}", self.responses.display()),
+                    "Clears the chat, input, loaded context, and counters. Keeps API keys, model selection, and installed models.".into(),
+                ], vec![menu_item("cancel", "keep everything", MenuAction::Close), menu_item("reset chat and history", "delete saved chat data", MenuAction::ResetChat)]));
             }
             "/help" => {
                 self.stage_before_help = self.stage;
@@ -1010,6 +1055,88 @@ impl App {
         } else {
             self.note("home — esc or ⌂ decisions brings the transcript back");
         }
+    }
+
+    fn clear_chat(&mut self) {
+        self.job += 1;
+        self.pending = None;
+        self.entries.clear();
+        self.history = None;
+        self.menu = None;
+        self.overlay = None;
+        self.go_home();
+        self.json_text.clear();
+        self.json_cells.clear();
+        self.json_selection = None;
+        self.json_scroll = 0;
+        self.note("chat cleared · saved history is kept (/history to reopen it)");
+    }
+
+    fn reset_chat(&mut self) {
+        match shev::clear_records(&self.responses) {
+            Ok(()) => {
+                self.clear_chat();
+                self.loaded = None;
+                self.tool_catalog.clear();
+                self.tokens = 0;
+                self.last_ms = None;
+                self.copied_until = None;
+                self.note("chat and saved history reset · keys and installed models kept");
+            }
+            Err(error) => self.warn(error),
+        }
+    }
+
+    fn confirm_history_delete(&mut self) {
+        let Some(index) = self.history.as_ref().map(|view| view.index) else {
+            return;
+        };
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        self.history = None;
+        self.menu = Some(Menu::new(
+            format!("delete {}?", entry.key),
+            vec!["Deletes only this saved history entry; all other entries are kept.".into()],
+            vec![
+                menu_item("cancel", "keep entry", MenuAction::Close),
+                menu_item(
+                    "delete entry",
+                    "remove from chat and saved history",
+                    MenuAction::DeleteHistory(index),
+                ),
+            ],
+        ));
+    }
+
+    fn delete_history_entry(&mut self, index: usize) {
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        let key = entry.key.clone();
+        if key != "unsaved"
+            && let Err(error) = shev::delete_record(&self.responses, &key)
+        {
+            self.warn(error);
+            return;
+        }
+        let removed = self.entries.remove(index);
+        self.tokens = self.tokens.saturating_sub(record_tokens(&removed.record));
+        self.json_selection = None;
+        self.json_scroll = 0;
+        self.entry_rows.clear();
+        self.scroll = u16::MAX;
+        self.home = self.entries.is_empty();
+        if self.home {
+            self.stage = Stage::Message;
+            self.message.clear();
+            self.intent.clear();
+        } else {
+            self.history = Some(HistoryView {
+                index: index.min(self.entries.len() - 1),
+            });
+        }
+        self.note(format!("deleted {key} from saved history"));
     }
 
     /// Show a centered panel, used for anything longer than a status line.
@@ -1059,6 +1186,11 @@ impl App {
 
     /// `/history` or ctrl+h: a jump list of the decisions so far.
     fn open_history(&mut self) {
+        if self.stage == Stage::Working {
+            self.warn("wait for the current request, or /cancel first");
+            return;
+        }
+        self.load_history();
         if self.entries.is_empty() {
             self.note("no decisions yet — the history is empty");
             return;
@@ -1192,6 +1324,14 @@ impl App {
                         schema.lines().map(str::to_string).collect(),
                     );
                 }
+            }
+            MenuAction::ResetChat => {
+                self.menu = None;
+                self.reset_chat();
+            }
+            MenuAction::DeleteHistory(index) => {
+                self.menu = None;
+                self.delete_history_entry(index);
             }
             MenuAction::Close => {
                 self.menu = None;
@@ -1439,6 +1579,10 @@ impl App {
     }
 
     fn copy(&mut self, rest: &str) {
+        if rest.is_empty() && self.json_selection.as_ref().is_some_and(|s| s.moved) {
+            self.copy_json_selection(copy_to_clipboard);
+            return;
+        }
         let Some(entry) = self.entries.last() else {
             self.warn("nothing to copy yet");
             return;
@@ -1464,8 +1608,40 @@ impl App {
             return;
         }
         match copy_to_clipboard(&payload) {
-            Ok(()) => self.note(format!("copied {what} from {} to the clipboard", entry.key)),
+            Ok(()) => {
+                self.note(format!("copied {what} from {} to the clipboard", entry.key));
+                self.copied_until = Some(Instant::now() + Duration::from_secs(2));
+            }
             Err(err) => self.warn(err),
+        }
+    }
+
+    fn json_hit(&self, column: u16, row: u16, clamp: bool) -> Option<Range<usize>> {
+        self.json_cells
+            .iter()
+            .filter(|cell| clamp || cell.position.y == row)
+            .min_by_key(|cell| {
+                (
+                    cell.position.y.abs_diff(row),
+                    cell.position.x.abs_diff(column),
+                )
+            })
+            .map(|cell| cell.bytes.clone())
+    }
+
+    fn copy_json_selection(&mut self, clipboard: impl FnOnce(&str) -> Result<(), String>) {
+        let Some(selection) = self.json_selection.as_ref().filter(|s| s.moved) else {
+            return;
+        };
+        let Some(text) = self.json_text.get(selection.range()) else {
+            return;
+        };
+        match clipboard(text) {
+            Ok(()) => {
+                self.copied_until = Some(Instant::now() + Duration::from_secs(2));
+                self.note("copied JSON selection to clipboard");
+            }
+            Err(error) => self.warn(error),
         }
     }
 
@@ -1733,9 +1909,19 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     // two windows, as drawn in shev.tldraw: the model output on the left, the
     // JSON for the current turn only in a narrow column on the right.
-    let json_width = (main_area.width / 3).clamp(20, 40);
-    let [output, json] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(json_width)]).areas(main_area);
+    let chat_visible = !app.home && (!app.entries.is_empty() || !app.message.is_empty());
+    let (output, json) = if chat_visible {
+        let json_width = (main_area.width / 3).clamp(20, 40);
+        let [output, json] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(json_width)])
+                .areas(main_area);
+        (output, Some(json))
+    } else {
+        app.json_area = None;
+        app.json_cells.clear();
+        app.json_rects.clear();
+        (main_area, None)
+    };
 
     // the wallpaper sits behind both windows; the panels on top are solid
     render_background(frame, main_area);
@@ -1745,7 +1931,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let [body_area, prompt_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(prompt_height)]).areas(output);
 
-    if app.home || app.entries.is_empty() {
+    if !chat_visible {
         render_logo(frame, app, body_area);
     } else {
         render_results(frame, app, body_area);
@@ -1753,7 +1939,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_prompt(frame, app, prompt_area);
 
     // right window: the JSON of the last turn only
-    render_json_window(frame, app, json);
+    if let Some(json) = json {
+        render_json_window(frame, app, json);
+    }
 
     render_hints(frame, app, hints_area);
     render_status(frame, app, status_area);
@@ -1772,6 +1960,19 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
     if app.history.is_some() {
         render_history(frame, app, screen);
+    }
+    if app.copied_until.is_some_and(|until| until > Instant::now()) {
+        let label = " ✓ copied to clipboard ";
+        let width = (label.chars().count() as u16).min(screen.width);
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(Color::White).bg(PANEL)),
+            Rect {
+                x: screen.x + screen.width.saturating_sub(width) / 2,
+                y: screen.y + 1,
+                width,
+                height: 1,
+            },
+        );
     }
 }
 
@@ -1841,7 +2042,12 @@ fn render_logo(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(0);
     let mut lines: Vec<Line> = trimmed
         .iter()
-        .map(|line| Line::from(Span::styled(pad(line, width), accent())))
+        .map(|line| {
+            Line::from(Span::styled(
+                pad(line, width),
+                Style::default().fg(Color::Rgb(255, 255, 255)),
+            ))
+        })
         .collect();
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(TITLE, accent_bold())));
@@ -1856,41 +2062,28 @@ fn render_logo(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    // the wordmark sits on its own solid box so it reads over the wallpaper
-    let inner_width = lines.iter().map(line_width).max().unwrap_or(width);
-    let box_width = (inner_width as u16 + 6)
-        .max(30)
-        .min(area.width.saturating_sub(2));
-    let box_height = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(box_width) / 2,
-        y: area.y + area.height.saturating_sub(box_height) / 2,
-        width: box_width,
-        height: box_height,
-    };
-
-    frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Block::default()
-            .style(Style::default().bg(PANEL))
-            .border_type(BorderType::Rounded)
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(ACCENT_DIM))
-            .title(Line::from(Span::styled(" shev ", accent()))),
-        rect,
-    );
-    let inner = Rect {
-        x: rect.x + 1,
-        y: rect.y + 1,
-        width: rect.width.saturating_sub(2),
-        height: rect.height.saturating_sub(2),
-    };
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .alignment(Alignment::Center)
-            .style(Style::default().bg(PANEL)),
-        inner,
-    );
+    // Paint only glyphs: spaces and all background pixels remain untouched.
+    let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
+    for (row, line) in lines.iter().enumerate() {
+        let y = top + row as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        let mut x = area.x + area.width.saturating_sub(line_width(line) as u16) / 2;
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                if x >= area.right() {
+                    break;
+                }
+                if !ch.is_whitespace() {
+                    frame.buffer_mut()[(x, y)]
+                        .set_char(ch)
+                        .set_style(span.style);
+                }
+                x += 1;
+            }
+        }
+    }
 }
 
 fn placeholder(app: &App) -> String {
@@ -2202,7 +2395,7 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// The right-hand window: the JSON of the last turn only, as the sketch shows.
-fn render_json_window(frame: &mut Frame, app: &App, area: Rect) {
+fn render_json_window(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = area.width.saturating_sub(2) as usize;
     let file_name = app
         .responses
@@ -2233,12 +2426,6 @@ fn render_json_window(frame: &mut Frame, app: &App, area: Rect) {
                 "─".repeat(inner.min(48)),
                 Style::default().fg(ACCENT_DIM),
             )));
-            let pretty = serde_json::to_string_pretty(&entry.record).unwrap_or_default();
-            for raw in pretty.lines() {
-                for piece in wrap_words(raw, inner.saturating_sub(2).max(8)) {
-                    lines.push(Line::from(Span::styled(piece, Style::default().fg(GRAY))));
-                }
-            }
         }
         None => {
             lines.push(Line::default());
@@ -2250,7 +2437,96 @@ fn render_json_window(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
     }
-    panel(frame, area, "this turn's JSON", lines);
+    let top = lines.len() as u16;
+    panel(frame, area, "this turn's JSON · drag to copy", lines);
+    let content = Rect {
+        x: area.x + 1,
+        y: (area.y + 1 + top).min(area.bottom()),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(top + 2),
+    };
+    app.json_area = Some(content);
+    let pretty = app
+        .entries
+        .last()
+        .and_then(|entry| serde_json::to_string_pretty(&entry.record).ok())
+        .unwrap_or_default();
+    if app.json_text != pretty {
+        app.json_text = pretty;
+        app.json_selection = None;
+        app.json_scroll = 0;
+    }
+    app.json_cells.clear();
+    let rows = json_visual_rows(&app.json_text, content.width as usize);
+    app.json_max_scroll = rows.len().saturating_sub(content.height as usize);
+    app.json_scroll = app.json_scroll.min(app.json_max_scroll);
+    for (row, bytes) in rows
+        .iter()
+        .skip(app.json_scroll)
+        .take(content.height as usize)
+        .enumerate()
+    {
+        let y = content.y + row as u16;
+        let text = &app.json_text[bytes.clone()];
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(GRAY).bg(PANEL)),
+            Rect {
+                y,
+                height: 1,
+                ..content
+            },
+        );
+        let mut x = content.x;
+        for (offset, grapheme) in text.grapheme_indices(true) {
+            let byte_range = bytes.start + offset..bytes.start + offset + grapheme.len();
+            let width = UnicodeWidthStr::width(grapheme) as u16;
+            if width == 0 {
+                if let Some(cell) = app.json_cells.last_mut() {
+                    cell.bytes.end = byte_range.end;
+                }
+            } else {
+                for col in x..(x + width).min(content.right()) {
+                    app.json_cells.push(JsonCell {
+                        position: Position::new(col, y),
+                        bytes: byte_range.clone(),
+                    });
+                }
+                x += width;
+            }
+        }
+    }
+    if let Some(selection) = &app.json_selection {
+        let bytes = selection.range();
+        for cell in &app.json_cells {
+            if cell.bytes.start < bytes.end && cell.bytes.end > bytes.start {
+                frame.buffer_mut()[cell.position].set_style(Style::default().fg(PANEL).bg(ACCENT));
+            }
+        }
+    }
+}
+
+/// Byte ranges keep clipboard text exact: soft wraps never add newlines or drop spaces.
+fn json_visual_rows(text: &str, width: usize) -> Vec<Range<usize>> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut columns = 0;
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        if grapheme == "\n" {
+            rows.push(start..offset);
+            start = offset + 1;
+            columns = 0;
+            continue;
+        }
+        let size = UnicodeWidthStr::width(grapheme);
+        if columns > 0 && columns + size > width.max(1) {
+            rows.push(start..offset);
+            start = offset;
+            columns = 0;
+        }
+        columns += size;
+    }
+    rows.push(start..text.len());
+    rows
 }
 
 /// The `/history` view: a compact jump list over the decisions so far.
@@ -2278,7 +2554,10 @@ fn render_history(frame: &mut Frame, app: &App, screen: Rect) {
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            format!("{} decision(s) · ↑↓ pick · enter jumps", app.entries.len()),
+            format!(
+                "{} entries · ↑↓ pick · enter opens · ctrl+d deletes",
+                app.entries.len()
+            ),
             dim(),
         ),
     ]));
@@ -2575,11 +2854,12 @@ fn render_palette(frame: &mut Frame, app: &mut App, column: Rect) {
 }
 
 fn render_help(frame: &mut Frame, app: &App, screen: Rect) {
-    let keys: [(&str, &str); 18] = [
+    let keys: [(&str, &str); 21] = [
         ("enter", "send the message, then the intent"),
         ("ctrl+j", "newline inside the box"),
         ("ctrl+t", "switch the model (DeepSeek ↔ Bonsai)"),
         ("ctrl+h", "open the history of decisions"),
+        ("ctrl+d", "delete the selected history entry (confirm)"),
         ("↑ ↓", "scroll the decisions / move in a menu"),
         ("esc", "close a menu or notice, or leave home"),
         ("/", "open the command list"),
@@ -2594,6 +2874,8 @@ fn render_help(frame: &mut Frame, app: &App, screen: Rect) {
         ("/tools", "inspect registered read-only MCP tools"),
         ("/tool", "call server/tool with JSON arguments"),
         ("/plugins", "show host plugin compatibility limits"),
+        ("/clear", "clear the chat, keeping saved history"),
+        ("/reset", "clear chat and saved history (confirm)"),
     ];
     let height = keys.len() as u16 + 4;
     let width = screen.width.saturating_sub(8).min(78);
@@ -3015,6 +3297,9 @@ fn parse_responses_arg() -> Result<PathBuf, String> {
                      Integrations: /skills · /tools [server] · /tool server/tool <JSON> · /plugins\n\
                      Tools must be declared read-only. Host-specific plugins require their original runtime."
                 );
+                println!(
+                    "MCP stdio: shev --mcp [-f <path>] (no terminal or API key required)\nChat: /clear keeps history · /reset clears saved chat data after confirmation\nHistory: ctrl+d deletes the selected entry after confirmation\nJSON: drag to select; release copies the selection to the clipboard"
+                );
                 std::process::exit(0);
             }
             "-f" | "--file" => {
@@ -3030,6 +3315,15 @@ fn parse_responses_arg() -> Result<PathBuf, String> {
 }
 
 fn main() -> ExitCode {
+    if env::args().skip(1).any(|arg| arg == "--mcp") {
+        return match shev::cli_run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let responses = match parse_responses_arg() {
         Ok(path) => path,
         Err(err) => {
@@ -3170,6 +3464,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // The history view: arrows move, enter jumps, esc closes.
     if app.history.is_some() {
         match key.code {
+            KeyCode::Char('d') if ctrl => app.confirm_history_delete(),
             KeyCode::Up => app.history_up(),
             KeyCode::Down => app.history_down(),
             KeyCode::Enter => app.history_jump(),
@@ -3194,6 +3489,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('y') if ctrl => app.copy(""),
         KeyCode::Char('u') if ctrl => {
             app.take_input();
+        }
+        KeyCode::Esc if app.json_selection.is_some() => {
+            app.json_selection = None;
         }
         KeyCode::Esc => {
             if app.palette {
@@ -3259,19 +3557,75 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 /// Mouse: the top-right home button, the per-decision JSON buttons, and scroll.
 fn handle_mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+    if app.menu.is_some()
+        || app.overlay.is_some()
+        || app.history.is_some()
+        || app.stage == Stage::Help
+    {
+        return;
+    }
     let inside = |rect: &Option<Rect>| {
         rect.map(|rect| rect.contains(Position::new(column, row)))
             .unwrap_or(false)
     };
 
     match kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.json_selection.as_ref().is_some_and(|s| s.dragging) {
+                if let Some(area) = app.json_area {
+                    if row >= area.bottom() {
+                        app.json_scroll = (app.json_scroll + 1).min(app.json_max_scroll);
+                    } else if row < area.y {
+                        app.json_scroll = app.json_scroll.saturating_sub(1);
+                    }
+                }
+                if let Some(bytes) = app.json_hit(column, row, true)
+                    && let Some(selection) = app.json_selection.as_mut()
+                {
+                    selection.moved |= selection.anchor != bytes;
+                    selection.focus = bytes;
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.json_selection.as_ref().is_some_and(|s| s.dragging) {
+                if let Some(bytes) = app.json_hit(column, row, true)
+                    && let Some(selection) = app.json_selection.as_mut()
+                {
+                    selection.moved |= selection.anchor != bytes;
+                    selection.focus = bytes;
+                    selection.dragging = false;
+                }
+                app.copy_json_selection(copy_to_clipboard);
+            }
+        }
         MouseEventKind::ScrollDown => {
-            app.scroll = app.scroll.saturating_add(1).min(app.max_scroll);
+            if inside(&app.json_area) {
+                app.json_scroll = (app.json_scroll + 3).min(app.json_max_scroll);
+            } else {
+                app.scroll = app.scroll.saturating_add(1).min(app.max_scroll);
+            }
         }
         MouseEventKind::ScrollUp => {
-            app.scroll = app.scroll.saturating_sub(1);
+            if inside(&app.json_area) {
+                app.json_scroll = app.json_scroll.saturating_sub(3);
+            } else {
+                app.scroll = app.scroll.saturating_sub(1);
+            }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            app.json_selection = None;
+            if inside(&app.json_area)
+                && let Some(bytes) = app.json_hit(column, row, false)
+            {
+                app.json_selection = Some(JsonSelection {
+                    anchor: bytes.clone(),
+                    focus: bytes,
+                    dragging: true,
+                    moved: false,
+                });
+                return;
+            }
             if inside(&app.home_rect) {
                 app.go_home();
                 return;
@@ -3353,7 +3707,14 @@ mod tests {
             screen.contains("shev — decisions, without the hype"),
             "{screen}"
         );
-        assert!(screen.contains(",pP\"Ybd  MMpMMMb."), "{screen}");
+        assert!(
+            screen.contains(",pP\"Ybd") && screen.contains("MMpMMMb."),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("this turn's JSON"),
+            "home must not have a JSON pane\n{screen}"
+        );
         assert!(screen.contains("Message anything"), "{screen}");
         assert!(screen.contains("Message · deepseek-chat"), "{screen}");
         assert!(screen.contains("/ commands"), "{screen}");
@@ -3817,6 +4178,174 @@ mod tests {
     }
 
     #[test]
+    fn logo_is_white_and_transparent_and_home_has_no_chat_panes() {
+        let mut app = app_for_test();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut white_logo = false;
+        for y in 1..30 {
+            for x in 0..120 {
+                let cell = &buffer[(x, y)];
+                assert_ne!(cell.symbol(), "╭", "no logo box on the home screen");
+                if cell.symbol() == "p" && cell.fg == Color::Rgb(255, 255, 255) {
+                    assert_ne!(cell.bg, PANEL, "logo must preserve wallpaper background");
+                    white_logo = true;
+                }
+            }
+        }
+        assert!(white_logo);
+        assert!(app.json_area.is_none());
+        let prompt = app.prompt_rect.unwrap();
+        assert_eq!(
+            buffer[(prompt.x + 2, prompt.y + 1)].bg,
+            Color::Rgb(15, 14, 8)
+        );
+        app.home = false;
+        app.message = "hello".into();
+        assert!(draw_to_string(&mut app, 120, 40).contains("this turn's JSON"));
+        app.go_home();
+        assert!(!draw_to_string(&mut app, 120, 40).contains("this turn's JSON"));
+    }
+
+    #[test]
+    fn json_drag_selection_preserves_unicode_spaces_and_soft_wraps() {
+        let mut app = app_for_test();
+        app.home = false;
+        app.entries.push(Entry { key:"response1".into(), record:serde_json::json!({"text":"é 猫 🙂 👩‍💻 a long string with spaces that will wrap across several visual rows"}) });
+        let _ = draw_to_string(&mut app, 90, 50);
+        assert_eq!(app.json_max_scroll, 0);
+        let emoji_start = app.json_text.find("👩‍💻").unwrap();
+        let emoji = app
+            .json_cells
+            .iter()
+            .find(|cell| cell.bytes.start == emoji_start)
+            .unwrap();
+        assert_eq!(&app.json_text[emoji.bytes.clone()], "👩‍💻");
+        assert_eq!(
+            app.json_cells
+                .iter()
+                .filter(|cell| cell.bytes.start == emoji_start)
+                .count(),
+            2
+        );
+        let first = app.json_cells.first().unwrap().position;
+        let last = app.json_cells.last().unwrap().position;
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            last.x,
+            last.y,
+        );
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            first.x,
+            first.y,
+        );
+        assert_eq!(
+            app.json_selection.as_ref().unwrap().range(),
+            0..app.json_text.len()
+        );
+        let expected = serde_json::to_string_pretty(&app.entries[0].record).unwrap();
+        app.copy_json_selection(|text| {
+            assert_eq!(text, expected);
+            Ok(())
+        });
+        let screen = draw_to_string(&mut app, 90, 50);
+        assert!(screen.contains("✓ copied to clipboard"), "{screen}");
+        app.copied_until = None;
+        app.copy_json_selection(|_| Err("clipboard unavailable".into()));
+        assert!(app.copied_until.is_none());
+        assert!(app.status_error);
+    }
+
+    #[test]
+    fn json_scroll_is_independent_of_chat_scroll() {
+        let mut app = app_for_test();
+        app.home = false;
+        app.entries.push(Entry {
+            key: "response1".into(),
+            record: serde_json::json!({"text":"x".repeat(4096)}),
+        });
+        let _ = draw_to_string(&mut app, 100, 30);
+        assert!(app.json_max_scroll > 0);
+        let area = app.json_area.unwrap();
+        let chat_scroll = app.scroll;
+        handle_mouse(&mut app, MouseEventKind::ScrollDown, area.x + 1, area.y + 1);
+        assert_eq!(app.json_scroll, 3);
+        assert_eq!(app.scroll, chat_scroll);
+        let _ = draw_to_string(&mut app, 100, 30);
+        assert!(app.json_cells.first().unwrap().bytes.start > 0);
+    }
+
+    #[test]
+    fn clear_keeps_history_reset_clears_it_and_ctrl_d_deletes_only_one_entry() {
+        let path = env::temp_dir().join(format!("shev-chat-controls-{}.json", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        write!(
+            file,
+            "{}",
+            serde_json::json!({
+                "response1":{"actionable":"first","confidence":80,"take_action":true},
+                "response2":{"actionable":"second","confidence":80,"take_action":true},
+                "response3":{"actionable":"third","confidence":80,"take_action":true}
+            })
+        )
+        .unwrap();
+        drop(file);
+        let mut app = app_for_test();
+        app.responses = path.clone();
+        app.load_history();
+        app.home = false;
+        app.stage = Stage::Result;
+        let original = fs::read_to_string(&path).unwrap();
+        app.execute_command("/clear");
+        assert!(app.entries.is_empty() && app.home);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        app.open_history();
+        app.history.as_mut().unwrap().index = 1;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert!(app.history.is_none());
+        assert_eq!(
+            app.menu.as_ref().unwrap().selected(),
+            Some(MenuAction::Close)
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "ctrl+d must confirm before deleting"
+        );
+        app.run_menu_action(MenuAction::DeleteHistory(1));
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("response2").is_none());
+        assert!(saved.get("response1").is_some() && saved.get("response3").is_some());
+        app.execute_command("/reset");
+        assert_eq!(
+            app.menu.as_ref().unwrap().selected(),
+            Some(MenuAction::Close)
+        );
+        assert_eq!(app.entries.len(), 2);
+        app.run_menu_action(MenuAction::ResetChat);
+        assert!(app.entries.is_empty() && app.home);
+        assert!(app.loaded.is_none());
+        assert_eq!(app.tokens, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(&path).unwrap()).unwrap(),
+            serde_json::json!({})
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn tool_discovery_is_not_reported_as_loading_and_results_are_real_context() {
         let mut app = app_for_test();
         app.home = false;
@@ -3852,6 +4381,12 @@ mod tests {
             .unwrap();
         app.poll_worker();
         assert_eq!(app.loaded.as_ref().unwrap().guidance, "actual result");
+        let screen = draw_to_string(&mut app, 120, 34);
+        assert!(
+            !screen.contains("this turn's JSON"),
+            "no panes before a chat exists"
+        );
+        app.message = "a chat message".into();
         let screen = draw_to_string(&mut app, 120, 34);
         assert!(screen.contains("loaded tool · fixture/lookup"), "{screen}");
     }

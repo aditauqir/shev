@@ -1013,6 +1013,80 @@ pub fn append_record(path: &Path, record: &Value) -> Result<String, String> {
     Ok(key)
 }
 
+/// Delete only the chosen saved history record. Never renumbers other records.
+pub fn delete_record(path: &Path, key: &str) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut records = history_map(path)?;
+    if records.remove(key).is_none() {
+        return Ok(false);
+    }
+    write_history(path, &records)?;
+    Ok(true)
+}
+
+/// Clear saved chat data, not configuration, credentials, or downloaded models.
+pub fn clear_records(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut records = history_map(path)?; // Refuse malformed files; preserve non-chat metadata.
+    records.retain(|key, _| {
+        key.strip_prefix("response")
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_none()
+    });
+    write_history(path, &records)
+}
+
+fn history_map(path: &Path) -> Result<Map<String, Value>, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("could not read history: {e}"))?;
+    if raw.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| "history is not a valid JSON object; left unchanged".into())
+}
+
+fn write_history(path: &Path, records: &Map<String, Value>) -> Result<(), String> {
+    let resolved =
+        fs::canonicalize(path).map_err(|e| format!("could not resolve history file: {e}"))?;
+    let path = resolved.as_path(); // Update the target, not an existing user symlink.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".shev-history-{}-{stamp}.tmp", std::process::id()));
+    let mut created = false;
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| format!("could not prepare history update: {e}"))?;
+        created = true;
+        if let Ok(metadata) = fs::metadata(path) {
+            fs::set_permissions(&temporary, metadata.permissions()).map_err(|e| e.to_string())?;
+        }
+        let body = serde_json::to_string_pretty(records).map_err(|e| e.to_string())?;
+        writeln!(file, "{body}")
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("could not write history: {e}"))?;
+        fs::rename(&temporary, path).map_err(|e| format!("could not replace history: {e}"))
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 pub fn store_decision(
     path: &Path,
     decision: &Value,
@@ -2597,7 +2671,7 @@ fn mcp_descriptor(exe: &Path, responses: &Path) -> Value {
     })
 }
 
-/// The opencode-flavoured entry (`mcp.<name>` with `type: local`).
+/// An OpenCode local-server entry (under `mcp.servers.<name>` in V2).
 fn mcp_opencode_entry(exe: &Path, responses: &Path) -> Value {
     json!({
         "type": "local",
@@ -2650,7 +2724,14 @@ fn write_pretty(path: &Path, value: &Value) -> Result<(), String> {
 /// present, register it there too. Reversible with [`mcp_uninstall`].
 pub fn mcp_install(responses: &Path) -> Result<String, String> {
     let exe = env::current_exe().map_err(|e| format!("could not find my own path: {e}"))?;
-    let responses = fs::canonicalize(responses).unwrap_or_else(|_| responses.to_path_buf());
+    let responses = if responses.is_absolute() {
+        responses.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("could not resolve the history path: {e}"))?
+            .join(responses)
+    };
+    let responses = fs::canonicalize(&responses).unwrap_or(responses);
     let dir = mcp_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
 
@@ -2990,6 +3071,65 @@ mod tests {
             .is_err()
         );
         assert_eq!(failures, 3);
+    }
+
+    #[test]
+    fn history_deletion_refuses_malformed_files_and_preserves_other_data() {
+        let path = env::temp_dir().join(format!("shev-history-delete-{}.json", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "not JSON").unwrap();
+        drop(file);
+        assert!(delete_record(&path, "response1").is_err());
+        assert!(clear_records(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not JSON");
+        fs::write(
+            &path,
+            r#"{"response1":{"text":"one"},"response2":{"text":"two"},"metadata":"keep"}"#,
+        )
+        .unwrap();
+        assert!(delete_record(&path, "response1").unwrap());
+        assert!(!delete_record(&path, "missing").unwrap());
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("response2").is_some());
+        clear_records(&path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(&path).unwrap()).unwrap(),
+            json!({"metadata":"keep"})
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clearing_history_keeps_a_user_symlink_intact() {
+        let target =
+            env::temp_dir().join(format!("shev-history-target-{}.json", std::process::id()));
+        let link = target.with_extension("link");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .unwrap();
+        write!(file, "{}", json!({"response1":{"text":"one"}})).unwrap();
+        drop(file);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        clear_records(&link).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(&target).unwrap()).unwrap(),
+            json!({})
+        );
+        fs::remove_file(link).unwrap();
+        fs::remove_file(target).unwrap();
     }
 
     #[test]

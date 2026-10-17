@@ -1268,6 +1268,8 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
