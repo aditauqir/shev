@@ -1,10 +1,10 @@
 # shev
 
-**A simple Jev-like decision making tool, without the hype.**
+**A simple Jev-like decision maker. Without the hype.**
 
-You hand it a whole message — an email, a ticket, a review, a document, a paste
-from a support queue — and you tell it what you want to do with that message. It
-gives you back **one** decision, as JSON:
+Hand it one whole message — an email, a ticket, a review, a doc, whatever you
+pasted out of the support queue — and tell it what you want done with it. It
+hands back **one** decision, as JSON:
 
 ```json
 {
@@ -15,21 +15,21 @@ gives you back **one** decision, as JSON:
 }
 ```
 
-That is the whole idea. No agents, no orchestration, no prompt engineering, no
-five-hundred-token system preamble you have to memorise. One message in, one
-decision out, saved to a file you can read.
+That's the whole thing. No agents. No orchestration. No prompt engineering. No
+five-hundred-token preamble to memorise. One message in, one decision out, in a
+file you can just read.
 
-- **The whole message is judged at once.** shev never splits it into paragraphs
-  and never decides line by line. One message, one decision.
-- **You say what you want.** Before it answers, shev asks what you want to do
-  with the message. That intent drives the written response.
-- **The decision has a shape.** `actionable` (a string), `take_action` (a
-  boolean), and `confidence` (an integer, always inside `[34, 100]`). The model
-  cannot hand you a tuple you have to guess at.
-- **It is local-friendly.** Talk to DeepSeek over the network, or run a small
-  ternary MLX model entirely on your Mac. Your call, switchable at runtime.
-- **It records everything.** Decisions accumulate in `responses.json` as
-  `response1`, `response2`, … and can be exposed to other models over MCP.
+- **Whole message, judged once.** It doesn't chop the thing into paragraphs and
+  it doesn't go line by line. One message, one decision.
+- **You say what you want.** It asks before it answers, and what you want done
+  is what drives the reply it writes.
+- **The answer has a shape.** `actionable` (a string), `take_action` (a
+  boolean), `confidence` (an integer, always in `[34, 100]`). No tuple you have
+  to guess at.
+- **Runs on your Mac if you want.** DeepSeek over the network, or a small
+  ternary MLX model sitting right there on the machine. Switch whenever.
+- **It writes it all down.** Decisions pile up in `responses.json` as
+  `response1`, `response2`, … and other models can read them over MCP.
 
 ## Install
 
@@ -39,15 +39,22 @@ One line, copy-pasteable:
 curl -fsSL https://raw.githubusercontent.com/aditauqir/shev/main/install.sh | bash
 ```
 
-If you already have Rust, this is the same thing and just as short:
+Got Rust already? Same thing, just as short:
 
 ```sh
 cargo install --git https://github.com/aditauqir/shev
 ```
 
-`shev` needs Apple Silicon or any machine with a terminal. Network features (the
-DeepSeek model) need an internet connection; the local model needs an Apple
-Silicon Mac.
+## What you need
+
+- **Best for local use:** Apple Silicon — **M1 or newer, 16 GB of RAM and up**.
+- **8 GB** will fit the local model too, but it's tight.
+- **Everything else:** runs anywhere with a DeepSeek API key. No Mac required.
+
+<sub>Only the local model cares about the Mac. It runs on MLX, and MLX is Apple
+Silicon only, so "run it on your machine" means "run it on a Mac". Point shev at
+a DeepSeek key instead and the work goes over the network — then it builds and
+runs on any platform Rust does.</sub>
 
 ## Quick start
 
@@ -55,23 +62,23 @@ Silicon Mac.
 shev
 ```
 
-1. On first run, paste a DeepSeek API key when asked. It is stored at
-   `~/.config/shev/config.json` with `0600` permissions and reused after that.
-2. Type (or paste) the whole message. Press **enter** to send, **ctrl+j** for a
-   new line inside a multi-line message.
-3. Say what you want to do with it — "draft a short reply", "tell me if this
-   needs me today", "summarise the risk".
-4. Read the decision. Press **enter** to start the next one, or click the
-   `▸ open responses.json in Finder` button to jump to the file.
+1. First run, paste a DeepSeek API key when it asks. It's stored at
+   `~/.config/shev/config.json` as `0600` and reused after that.
+2. Type or paste the whole message. **enter** sends it, **ctrl+j** drops a new
+   line in the middle of a multi-line one.
+3. Say what you want done with it — "draft a short reply", "does this need me
+   today", "where's the risk here".
+4. Read the decision. **enter** starts the next one, or click
+   `▸ open responses.json in Finder` and go look at the file.
 
-Everything after the first run is just: run `shev`, type, done.
+After the first run it's just: run `shev`, type, done.
 
 ## The TUI
 
-`shev` opens a terminal UI: a centred logo on its own solid panel, a prompt box
-that starts at two lines and grows with your text, a command palette, and a
-token/usage readout in the corner. The blocks sit on solid boxes over a dim
-background so the text always stays readable.
+`shev` opens a terminal UI: a centred wordmark on its own solid panel, a prompt
+box that starts at two lines and grows with your text, a command palette, and a
+token readout in the corner. The blocks sit on solid boxes over a dim background
+so the text stays readable.
 
 Type `/` for the command list:
 
@@ -99,18 +106,17 @@ key, remove the stored key, or cancel.
 runs on Apple Silicon through MLX. Options: install it from the internet
 (about 1.2 GB, into `~/.local/share/shev/models`) or uninstall it.
 
-The Bonsai pack ships its own loader, because its weights cannot be loaded by
+The Bonsai pack ships its own loader, because its weights can't be loaded by
 stock `mlx-lm`/`mlx-vlm` (they report `Unsupported model type:
-prism_hadamard_qwen35`). shev therefore runs the pack's bundled runtime in a
-one-shot subprocess per request, using `uv` with the pack's pinned requirements.
-Nothing listens on a port, and no server is left running. The first local
-request installs the MLX stack into a `uv` environment, which can take a few
-minutes.
+prism_hadamard_qwen35`). So shev runs the pack's bundled runtime in a one-shot
+subprocess per request, using `uv` with the pack's pinned requirements. Nothing
+listens on a port, and no server is left running. The first local request
+installs the MLX stack into a `uv` environment, which can take a few minutes.
 
 ## MCP
 
-`/mcp install` registers a local, read-only MCP server that exposes your
-recorded decisions to other models. Tools: `list_decisions`, `latest_decision`,
+`/mcp install` registers a local, read-only MCP server that hands your recorded
+decisions to other models. Tools: `list_decisions`, `latest_decision`,
 `get_decision`, `search_decisions`; resources: `deepslop://decisions` and
 `deepslop://decisions/latest`. The same server runs standalone:
 
@@ -122,7 +128,7 @@ shev --mcp
 
 ## CLI
 
-The TUI is the friendly front door. The line-based CLI is `shev-cli` and is meant
+The TUI is the friendly front door. The line CLI is `shev-cli` and it's meant
 for pipes:
 
 ```sh
