@@ -46,19 +46,32 @@ profile; open a new terminal and type `shev`—no manual shell edits needed.
 Prefer npm?
 
 ```sh
-npm install -g git+https://github.com/aditauqir/shev.git
+npm install -g @noorslvt/shev
 shev
 ```
 
 This installs the package **`@noorslvt/shev`**, with the terminal commands
 `shev` and `shev-cli`. The unscoped npm registry name `shev` belongs to an
-unrelated project; **do not use `npm install -g shev`** for this tool. This
-GitHub install does not require a separate npm registry publication.
+unrelated project; **do not use `npm install -g shev`** for this tool. You can
+also install straight from the repo without the registry:
+
+```sh
+npm install -g git+https://github.com/aditauqir/shev.git
+```
 
 Both installers prefer a matching prebuilt release and otherwise build with
-Rust (installing the minimal Rust toolchain if necessary). npm uses the source
-shipped in its package, not an unrelated registry binary. macOS/Linux are
-supported by the npm launcher; Windows users can use WSL.
+Rust (installing the minimal Rust toolchain if necessary). npm runs a
+`postinstall` step that fetches the right binary or builds it; macOS/Linux are
+supported by the npm launcher, and Windows users can use WSL.
+
+Recent npm releases gate install scripts. If your install is skipped, `shev`
+tells you what to run; you can also fix it up front:
+
+```sh
+# if npm blocked the install scripts:
+npm approve-scripts @noorslvt/shev   # or:
+npm rebuild -g @noorslvt/shev --foreground-scripts
+```
 
 Got Rust already? Same thing, just as short:
 
