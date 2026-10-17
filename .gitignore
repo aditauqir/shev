@@ -1,0 +1,26 @@
+/target
+
+# --- secrets: never commit an API key -------------------------------
+.env
+.env.*
+*.key
+*.pem
+*.p12
+secrets.json
+credentials.json
+# a config.json dropped next to the source (the real one lives in
+# ~/.config/shev/config.json, outside the repo, but belt and braces)
+config.json
+
+# --- runtime output (may contain private messages) ------------------
+responses.json
+responses.json.*
+responses.prev-*.json
+*.shev.json
+
+# --- local models ---------------------------------------------------
+/models/
+
+# --- misc -----------------------------------------------------------
+.DS_Store
+**/*.rs.bk
