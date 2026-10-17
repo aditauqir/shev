@@ -50,7 +50,7 @@ npm install -g git+https://github.com/aditauqir/shev.git
 shev
 ```
 
-This installs the package **`@aditauqir/shev`**, with the terminal commands
+This installs the package **`@noorslvt/shev`**, with the terminal commands
 `shev` and `shev-cli`. The unscoped npm registry name `shev` belongs to an
 unrelated project; **do not use `npm install -g shev`** for this tool. This
 GitHub install does not require a separate npm registry publication.
@@ -88,7 +88,7 @@ non-chat metadata in export files, source checkouts, and shared tools/caches
 You can also remove the npm package directly:
 
 ```sh
-npm uninstall -g @aditauqir/shev
+npm uninstall -g @noorslvt/shev
 ```
 
 This removes the npm package and its binaries. **Modern npm does not execute

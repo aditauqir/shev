@@ -30,3 +30,6 @@ responses.prev-*.json
 # --- misc -----------------------------------------------------------
 .DS_Store
 **/*.rs.bk
+
+# release tarballs are attached to GitHub releases, not committed
+/dist/

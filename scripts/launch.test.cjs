@@ -7,7 +7,7 @@ const { spawnSync } = require('node:child_process');
 
 function fixture() {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'shev-npm-test-')));
-  const root = path.join(home, 'global', 'lib', 'node_modules', '@aditauqir', 'shev');
+  const root = path.join(home, 'global', 'lib', 'node_modules', '@noorslvt', 'shev');
   for (const name of ['scripts', 'bin', 'native/bin']) fs.mkdirSync(path.join(root, name), { recursive: true });
   for (const name of ['scripts/launch.cjs', 'bin/shev.cjs', 'bin/shev-cli.cjs', 'package.json']) {
     fs.copyFileSync(path.join(__dirname, '..', name), path.join(root, name));
@@ -51,6 +51,6 @@ test('full confirmed removal invokes npm only for the package owning this wrappe
   try {
     const result = spawnSync(process.execPath, [path.join(f.root, 'bin/shev.cjs'), '--uninstall', '--yes'], { env: f.env });
     assert.equal(result.status, 0);
-    assert.deepEqual(JSON.parse(fs.readFileSync(f.npmLog)), ['uninstall', '--global', '@aditauqir/shev']);
+    assert.deepEqual(JSON.parse(fs.readFileSync(f.npmLog)), ['uninstall', '--global', '@noorslvt/shev']);
   } finally { fs.rmSync(f.home, { recursive: true }); }
 });
